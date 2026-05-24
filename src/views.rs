@@ -1,0 +1,688 @@
+use axum::extract::{Path, State};
+use axum::http::{HeaderValue, StatusCode, Uri, header};
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use uuid::Uuid;
+
+use crate::error::ApiError;
+use crate::state::{AppState, BuildState};
+
+pub async fn index() -> Response {
+    let body = page(
+        "Kei",
+        r#"<h1>Kei</h1>
+<ul class="nav">
+  <li><a href="/builds">Builds</a></li>
+  <li><a href="/api/projects">Projects (JSON)</a></li>
+  <li><a href="/api/artifacts">Artifacts (JSON)</a></li>
+  <li><a href="/artifacts/">Artifact files</a></li>
+</ul>"#,
+    );
+    Html(body).into_response()
+}
+
+pub async fn list_builds(State(state): State<AppState>) -> Response {
+    let builds = state.list_builds().await;
+    let mut rows = String::new();
+    if builds.is_empty() {
+        rows.push_str(r#"<tr><td colspan="5" class="muted">No builds yet.</td></tr>"#);
+    } else {
+        for b in &builds {
+            let dur = match b.finished_at {
+                Some(end) => format!("{}s", (end - b.started_at).num_seconds()),
+                None => format!("{}s+", (chrono::Utc::now() - b.started_at).num_seconds()),
+            };
+            rows.push_str(&format!(
+                r#"<tr>
+  <td><a href="/builds/{id}">#{number}</a> <span class="muted"><code>{short}</code></span></td>
+  <td>{project}</td>
+  <td><span class="state {state_cls}">{state}</span></td>
+  <td>{step}</td>
+  <td class="muted">{started} · {dur}</td>
+</tr>"#,
+                id = b.id,
+                number = b.number,
+                short = short_id(&b.id),
+                project = html_escape(&b.project),
+                state_cls = state_class(&b.state),
+                state = state_label(&b.state),
+                step = b
+                    .current_step
+                    .as_deref()
+                    .map(html_escape)
+                    .unwrap_or_default(),
+                started = b.started_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                dur = dur,
+            ));
+        }
+    }
+    let body = format!(
+        r#"<h1><a href="/">Kei</a> — Builds</h1>
+<table>
+  <thead><tr><th>ID</th><th>Project</th><th>State</th><th>Step</th><th>Started · Duration</th></tr></thead>
+  <tbody>{rows}</tbody>
+</table>"#
+    );
+    Html(page("Builds", &body)).into_response()
+}
+
+pub async fn build_detail(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let b = state
+        .get_build(id)
+        .await
+        .ok_or_else(|| ApiError::not_found("build not found"))?;
+
+    let live = matches!(b.state, BuildState::Queued | BuildState::Running);
+
+    let dur = match b.finished_at {
+        Some(end) => format!("{}s", (end - b.started_at).num_seconds()),
+        None => format!("{}s (running)", (chrono::Utc::now() - b.started_at).num_seconds()),
+    };
+
+    let mut artifacts_items = String::new();
+    for a in &b.artifacts {
+        artifacts_items.push_str(&format!(
+            r#"<li><a href="{url}">{path}</a> <span class="muted">({size})</span></li>"#,
+            url = html_escape(&a.url),
+            path = html_escape(&a.path),
+            size = human_bytes(a.size),
+        ));
+    }
+    let artifacts_section_style = if b.artifacts.is_empty() {
+        "display:none"
+    } else {
+        ""
+    };
+
+    let (error_attr_style, error_text) = match &b.error {
+        Some(e) => ("", html_escape(e)),
+        None => ("display:none", String::new()),
+    };
+
+    let log_html = if b.log.is_empty() {
+        r#"<p class="muted" id="log-empty">No output yet.</p><pre class="log" id="log" style="display:none"></pre>"#.to_string()
+    } else {
+        format!(
+            r#"<p class="muted" id="log-empty" style="display:none">No output yet.</p><pre class="log" id="log">{}</pre>"#,
+            html_escape(&b.log)
+        )
+    };
+
+    // Polling script: re-fetches /api/builds/:id every 2s while the build is
+    // live, patches in-place (no flash, no scroll reset), and only auto-scrolls
+    // the log to the bottom if the user was already pinned there.
+    let live_script = if live {
+        format!(
+            r#"<script>
+(function() {{
+  const buildId = {id:?};
+  const NEAR_BOTTOM_PX = 24;
+  const els = {{
+    state: document.getElementById('state'),
+    step: document.getElementById('step'),
+    dur: document.getElementById('dur'),
+    log: document.getElementById('log'),
+    logEmpty: document.getElementById('log-empty'),
+    artifactsSection: document.getElementById('artifacts-section'),
+    artifacts: document.getElementById('artifacts'),
+    errorBox: document.getElementById('error-box'),
+    errorText: document.getElementById('error-text'),
+  }};
+  async function tick() {{
+    let resp;
+    try {{
+      resp = await fetch('/api/builds/' + buildId, {{ cache: 'no-store' }});
+      if (!resp.ok) throw new Error('http ' + resp.status);
+    }} catch (e) {{
+      setTimeout(tick, 2000);
+      return;
+    }}
+    const b = await resp.json();
+    els.state.textContent = b.state;
+    els.state.className = 'state ' + b.state;
+    els.step.textContent = b.current_step || '—';
+    const started = new Date(b.started_at);
+    const end = b.finished_at ? new Date(b.finished_at) : new Date();
+    const secs = Math.max(0, Math.round((end - started) / 1000));
+    els.dur.textContent = secs + (b.finished_at ? 's' : 's (running)');
+    const log = b.log || '';
+    if (log.length) {{
+      els.logEmpty.style.display = 'none';
+      els.log.style.display = '';
+      // Only auto-scroll if we were already near the bottom — preserves
+      // user scroll position when they scroll up to read.
+      const wasAtBottom =
+        els.log.scrollHeight - els.log.scrollTop - els.log.clientHeight < NEAR_BOTTOM_PX;
+      if (els.log.textContent !== log) {{
+        els.log.textContent = log;
+        if (wasAtBottom) els.log.scrollTop = els.log.scrollHeight;
+      }}
+    }}
+    if (b.artifacts && b.artifacts.length) {{
+      els.artifactsSection.style.display = '';
+      els.artifacts.innerHTML = b.artifacts.map(a =>
+        '<li><a href="' + a.url + '">' + a.path + '</a> <span class="muted">(' + a.size + ' B)</span></li>'
+      ).join('');
+    }}
+    if (b.error) {{
+      els.errorBox.style.display = '';
+      els.errorText.textContent = b.error;
+    }}
+    if (b.state === 'queued' || b.state === 'running') {{
+      setTimeout(tick, 2000);
+    }}
+  }}
+  setTimeout(tick, 2000);
+}})();
+</script>"#,
+            id = b.id.to_string()
+        )
+    } else {
+        String::new()
+    };
+
+    let body = format!(
+        r#"<h1><a href="/builds">Builds</a> / #{number} <span class="muted"><code>{short}</code></span></h1>
+<dl class="meta">
+  <dt>Project</dt><dd>{project}</dd>
+  <dt>State</dt><dd><span class="state {state_cls}" id="state">{state}</span></dd>
+  <dt>Current step</dt><dd id="step">{step}</dd>
+  <dt>Commit</dt><dd><code>{commit}</code></dd>
+  <dt>Started</dt><dd>{started}</dd>
+  <dt>Duration</dt><dd id="dur">{dur}</dd>
+</dl>
+<div class="error" id="error-box" style="{error_style}"><strong>Error:</strong> <span id="error-text">{error_text}</span></div>
+<section id="artifacts-section" style="{artifacts_style}"><h2>Artifacts</h2><ul class="artifacts" id="artifacts">{artifacts_items}</ul></section>
+<h2>Log <a class="raw" href="/api/builds/{id}/log">raw</a></h2>
+{log_html}
+{live_script}"#,
+        number = b.number,
+        short = short_id(&b.id),
+        project = html_escape(&b.project),
+        state_cls = state_class(&b.state),
+        state = state_label(&b.state),
+        step = b
+            .current_step
+            .as_deref()
+            .map(html_escape)
+            .unwrap_or_else(|| "—".into()),
+        commit = b.commit.as_deref().map(html_escape).unwrap_or_default(),
+        started = b.started_at.format("%Y-%m-%d %H:%M:%S UTC"),
+        dur = dur,
+        id = b.id,
+        error_style = error_attr_style,
+        artifacts_style = artifacts_section_style,
+        artifacts_items = artifacts_items,
+    );
+    let title = format!("Build #{}", b.number);
+    Ok(Html(page(&title, &body)).into_response())
+}
+
+/// Serves anything under `/artifacts/...`. Directories render an HTML index;
+/// files stream from disk with a mime type guessed from the extension.
+/// Replaces tower-http ServeDir + nest_service, which had two issues for our
+/// use case: (1) directories without index.html returned 404, and the
+/// not_found_service fallback's status got mangled to 404; (2) the trailing-
+/// slash redirect lost the `/artifacts` prefix because nest_service strips it.
+pub async fn artifacts_handler(
+    State(state): State<AppState>,
+    uri: Uri,
+) -> Response {
+    serve_tree(state.config.storage.artifacts_dir.clone(), "/artifacts", uri).await
+}
+
+/// Serves the configured Maven repository at `/maven/...`. Same file/dir
+/// semantics as the artifacts handler; gated by the `maven` cargo feature.
+#[cfg(feature = "maven")]
+pub async fn maven_handler(
+    State(state): State<AppState>,
+    uri: Uri,
+) -> Response {
+    let Some(root) = state.config.maven.repo_dir.clone() else {
+        return (StatusCode::NOT_FOUND, "maven repo not configured").into_response();
+    };
+    serve_tree(root, "/maven", uri).await
+}
+
+async fn serve_tree(mut fs_path: std::path::PathBuf, prefix: &str, uri: Uri) -> Response {
+    let raw_path = uri.path();
+    let rel = raw_path
+        .strip_prefix(prefix)
+        .unwrap_or("")
+        .trim_start_matches('/');
+
+    if !rel.is_empty() {
+        // Reject path traversal — only accept clean, non-empty segments.
+        for seg in rel.trim_end_matches('/').split('/') {
+            if seg.is_empty() || seg == "." || seg == ".." {
+                return (StatusCode::NOT_FOUND, "not found").into_response();
+            }
+            fs_path.push(seg);
+        }
+    }
+
+    let meta = match tokio::fs::metadata(&fs_path).await {
+        Ok(m) => m,
+        Err(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    };
+
+    if meta.is_file() {
+        return serve_file(&fs_path, meta.len()).await;
+    }
+    if !meta.is_dir() {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+
+    if !raw_path.ends_with('/') {
+        return Redirect::permanent(&format!("{raw_path}/")).into_response();
+    }
+
+    render_directory(&fs_path, rel).await
+}
+
+async fn render_directory(fs_path: &std::path::Path, rel: &str) -> Response {
+    let mut rd = match tokio::fs::read_dir(fs_path).await {
+        Ok(r) => r,
+        Err(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    };
+    let mut items: Vec<(String, bool, u64, Option<chrono::DateTime<chrono::Utc>>)> = Vec::new();
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        // Follow symlinks (the per-project `latest` link points at a build
+        // directory) so size and is_dir reflect the target, not the link.
+        let m = match tokio::fs::metadata(e.path()).await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let modified = m.modified().ok().map(chrono::DateTime::<chrono::Utc>::from);
+        items.push((name, m.is_dir(), m.len(), modified));
+    }
+    // `latest` (the per-project symlink to the most recent build) always
+    // pins to the top. Below that: most-recently-modified first, with
+    // directories before files within each modtime group, then alphabetical.
+    items.sort_by(|a, b| {
+        let a_latest = a.0 == "latest";
+        let b_latest = b.0 == "latest";
+        b_latest
+            .cmp(&a_latest)
+            .then_with(|| b.3.cmp(&a.3))
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut rows = String::new();
+    if !rel.is_empty() {
+        rows.push_str(
+            r#"<tr><td><a href="../">../</a></td><td class="muted"></td><td class="muted"></td></tr>"#,
+        );
+    }
+    if items.is_empty() && rel.is_empty() {
+        rows.push_str(r#"<tr><td colspan="3" class="muted">No artifacts yet.</td></tr>"#);
+    }
+    for (name, is_dir, size, modified) in &items {
+        let escaped = html_escape(name);
+        let (href, label, size_cell) = if *is_dir {
+            (format!("{escaped}/"), format!("{escaped}/"), String::new())
+        } else {
+            (escaped.clone(), escaped, human_bytes(*size))
+        };
+        let mtime_cell = modified
+            .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_default();
+        rows.push_str(&format!(
+            r#"<tr><td><a href="{href}">{label}</a></td><td class="muted">{size_cell}</td><td class="muted">{mtime_cell}</td></tr>"#
+        ));
+    }
+
+    let crumb = if rel.is_empty() {
+        "Artifacts".to_string()
+    } else {
+        format!("Artifacts / {}", html_escape(rel.trim_end_matches('/')))
+    };
+    let body = format!(
+        r#"<h1><a href="/">Kei</a> — {crumb}</h1>
+<table>
+  <thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead>
+  <tbody>{rows}</tbody>
+</table>"#
+    );
+    Html(page(&crumb, &body)).into_response()
+}
+
+async fn serve_file(fs_path: &std::path::Path, size: u64) -> Response {
+    let bytes = match tokio::fs::read(fs_path).await {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    };
+    let mime = mime_for(fs_path);
+    let mut resp = (StatusCode::OK, bytes).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(mime),
+    );
+    if let Ok(v) = HeaderValue::from_str(&size.to_string()) {
+        resp.headers_mut().insert(header::CONTENT_LENGTH, v);
+    }
+    resp
+}
+
+fn mime_for(path: &std::path::Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("jar") => "application/java-archive",
+        Some("zip") => "application/zip",
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("json") => "application/json",
+        Some("log") | Some("txt") => "text/plain; charset=utf-8",
+        Some("xml") => "application/xml",
+        Some("css") => "text/css",
+        Some("js") => "application/javascript",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("svg") => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Hex-only sha guard — accept `[0-9a-fA-F]+` and nothing else, so a malicious
+/// `:sha` like `..` can't be used to escape the workspace.
+fn valid_sha(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Locate `project`'s workspace dir without falling through to arbitrary
+/// filesystem paths supplied by URL.
+fn workspace_for(state: &AppState, project: &str) -> Option<std::path::PathBuf> {
+    let p = state.config.project(project)?;
+    Some(state.config.storage.workspace_dir.join(&p.name))
+}
+
+pub async fn commit_view(
+    State(state): State<AppState>,
+    Path((project, sha)): Path<(String, String)>,
+) -> Response {
+    if !valid_sha(&sha) {
+        return (StatusCode::BAD_REQUEST, "invalid sha").into_response();
+    }
+    let Some(workspace) = workspace_for(&state, &project) else {
+        return (StatusCode::NOT_FOUND, "no such project").into_response();
+    };
+    let info = match crate::git::show_commit(&workspace, &sha).await {
+        Ok(i) => i,
+        Err(_) => return (StatusCode::NOT_FOUND, "commit not found").into_response(),
+    };
+
+    let body = format!(
+        r#"<h1><a href="/">Kei</a> — {project_esc} · <code>{short}</code></h1>
+<dl class="meta">
+  <dt>Project</dt><dd>{project_esc}</dd>
+  <dt>SHA</dt><dd><code>{sha_esc}</code></dd>
+  <dt>Author</dt><dd>{author}</dd>
+  <dt>Date</dt><dd>{date}</dd>
+  <dt>Subject</dt><dd>{subject}</dd>
+</dl>
+<h2>Message</h2>
+<pre class="log">{body_text}</pre>
+<h2>Files changed</h2>
+<pre class="log">{stat}</pre>
+<h2>Diff</h2>
+{diff_html}"#,
+        project_esc = html_escape(&project),
+        short = html_escape(&info.sha.chars().take(7).collect::<String>()),
+        sha_esc = html_escape(&info.sha),
+        author = html_escape(&info.author),
+        date = html_escape(&info.date),
+        subject = html_escape(&info.subject),
+        body_text = html_escape(&info.body),
+        stat = html_escape(&info.stat),
+        diff_html = render_diff(&info.diff),
+    );
+    Html(page(&format!("Commit {} · {}", short_str(&info.sha), project), &body)).into_response()
+}
+
+/// Renders a unified diff as line-classified `<div>`s — GitHub-style
+/// red/green coloring for removals/additions, blue for hunk headers,
+/// muted gray for the file/index metadata.
+fn render_diff(text: &str) -> String {
+    if text.trim().is_empty() {
+        return r#"<p class="muted">No diff (empty commit?).</p>"#.to_string();
+    }
+    let mut out = String::with_capacity(text.len() * 2);
+    out.push_str(r#"<div class="diff">"#);
+    for line in text.lines() {
+        let class = if line.starts_with("diff --git")
+            || line.starts_with("index ")
+            || line.starts_with("new file mode")
+            || line.starts_with("deleted file mode")
+            || line.starts_with("rename ")
+            || line.starts_with("similarity ")
+            || line.starts_with("Binary files")
+        {
+            "diff-meta"
+        } else if line.starts_with("---") || line.starts_with("+++") {
+            "diff-fileheader"
+        } else if line.starts_with("@@") {
+            "diff-hunk"
+        } else if line.starts_with('+') {
+            "diff-add"
+        } else if line.starts_with('-') {
+            "diff-del"
+        } else {
+            "diff-ctx"
+        };
+        out.push_str(&format!(
+            r#"<div class="{class}">{}</div>"#,
+            // Render empty lines with a non-breaking space so the row still
+            // has height and shows its background color.
+            if line.is_empty() {
+                "&nbsp;".to_string()
+            } else {
+                html_escape(line)
+            }
+        ));
+    }
+    out.push_str("</div>");
+    out
+}
+
+pub async fn compare_view(
+    State(state): State<AppState>,
+    Path((project, range)): Path<(String, String)>,
+) -> Response {
+    let (from, to) = match range.split_once("...") {
+        Some((a, b)) if valid_sha(a) && valid_sha(b) => (a.to_string(), b.to_string()),
+        _ => return (StatusCode::BAD_REQUEST, "invalid range").into_response(),
+    };
+    let Some(workspace) = workspace_for(&state, &project) else {
+        return (StatusCode::NOT_FOUND, "no such project").into_response();
+    };
+    let commits = match crate::git::log_range(&workspace, &from, &to).await {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::NOT_FOUND, "compare not available").into_response(),
+    };
+
+    let mut rows = String::new();
+    if commits.is_empty() {
+        rows.push_str(r#"<tr><td colspan="3" class="muted">No commits in range.</td></tr>"#);
+    } else {
+        for c in &commits {
+            rows.push_str(&format!(
+                r#"<tr><td><a href="/commits/{project}/{sha}"><code>{short}</code></a></td><td>{subject}</td><td class="muted">{author} · {date}</td></tr>"#,
+                project = html_escape(&project),
+                sha = html_escape(&c.sha),
+                short = html_escape(&c.sha.chars().take(7).collect::<String>()),
+                subject = html_escape(&c.subject),
+                author = html_escape(&c.author),
+                date = html_escape(&c.date),
+            ));
+        }
+    }
+
+    let body = format!(
+        r#"<h1><a href="/">Kei</a> — {project_esc} · <code>{from_short}</code>…<code>{to_short}</code></h1>
+<p class="muted">{count} commits</p>
+<table>
+  <thead><tr><th>SHA</th><th>Subject</th><th>Author · Date</th></tr></thead>
+  <tbody>{rows}</tbody>
+</table>"#,
+        project_esc = html_escape(&project),
+        from_short = html_escape(&short_str(&from)),
+        to_short = html_escape(&short_str(&to)),
+        count = commits.len(),
+    );
+    Html(page(
+        &format!("{} compare {}…{}", project, short_str(&from), short_str(&to)),
+        &body,
+    ))
+    .into_response()
+}
+
+fn short_str(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
+
+pub async fn build_log_raw(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let b = state
+        .get_build(id)
+        .await
+        .ok_or_else(|| ApiError::not_found("build not found"))?;
+    let mut resp = (StatusCode::OK, b.log).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    Ok(resp)
+}
+
+fn page(title: &str, body: &str) -> String {
+    let title = html_escape(title);
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{title} · Kei</title>
+<style>
+  :root {{
+    --bg: #0f1115; --fg: #d6dae0; --muted: #7c8492; --accent: #6cb6ff;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149; --run: #6cb6ff;
+    --panel: #161922; --border: #232936;
+  }}
+  * {{ box-sizing: border-box; }}
+  html, body {{ background: var(--bg); color: var(--fg); }}
+  body {{ font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+         margin: 0; padding: 24px; max-width: 1100px; margin-inline: auto; }}
+  h1, h2 {{ margin: 0.6em 0 0.4em; font-weight: 600; }}
+  h1 {{ font-size: 1.4em; }}
+  h2 {{ font-size: 1.1em; border-bottom: 1px solid var(--border); padding-bottom: 4px; }}
+  a {{ color: var(--accent); text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  code {{ font-family: ui-monospace, Menlo, Consolas, monospace; }}
+  .muted {{ color: var(--muted); }}
+  .nav {{ list-style: none; padding: 0; display: flex; gap: 16px; }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }}
+  th {{ color: var(--muted); font-weight: 500; font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.05em; }}
+  .state {{ display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.8em; font-weight: 600; }}
+  .state.queued {{ background: #21262d; color: var(--muted); }}
+  .state.running {{ background: rgba(108,182,255,0.15); color: var(--run); }}
+  .state.success {{ background: rgba(63,185,80,0.15); color: var(--ok); }}
+  .state.failed {{ background: rgba(248,81,73,0.15); color: var(--err); }}
+  dl.meta {{ display: grid; grid-template-columns: max-content 1fr; gap: 4px 18px; margin: 12px 0; }}
+  dl.meta dt {{ color: var(--muted); }}
+  dl.meta dd {{ margin: 0; }}
+  pre.log {{ background: var(--panel); border: 1px solid var(--border);
+             padding: 14px; border-radius: 8px; overflow-x: auto;
+             font: 12.5px/1.55 ui-monospace, Menlo, Consolas, monospace;
+             white-space: pre-wrap; word-break: break-word;
+             max-height: 70vh; }}
+  .error {{ background: rgba(248,81,73,0.1); border: 1px solid var(--err);
+            padding: 10px 14px; border-radius: 6px; margin: 12px 0; }}
+  ul.artifacts {{ padding-left: 18px; }}
+  a.raw {{ font-size: 0.75em; color: var(--muted); margin-left: 8px; }}
+  .diff {{ background: var(--panel); border: 1px solid var(--border);
+           border-radius: 8px; overflow-x: auto;
+           font: 12.5px/1.55 ui-monospace, Menlo, Consolas, monospace; }}
+  .diff > div {{ padding: 0 14px; white-space: pre-wrap; word-break: break-word; }}
+  .diff-add {{ background: rgba(63,185,80,0.18); color: #b4f1bd; }}
+  .diff-del {{ background: rgba(248,81,73,0.18); color: #fbb9b3; }}
+  .diff-hunk {{ background: rgba(108,182,255,0.10); color: var(--accent); }}
+  .diff-meta {{ color: var(--muted); }}
+  .diff-fileheader {{ color: var(--muted); font-weight: 600; }}
+  .diff-ctx {{ color: var(--fg); }}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>
+"#
+    )
+}
+
+fn state_class(s: &BuildState) -> &'static str {
+    match s {
+        BuildState::Queued => "queued",
+        BuildState::Running => "running",
+        BuildState::Success => "success",
+        BuildState::Failed => "failed",
+    }
+}
+
+fn state_label(s: &BuildState) -> &'static str {
+    match s {
+        BuildState::Queued => "queued",
+        BuildState::Running => "running",
+        BuildState::Success => "success",
+        BuildState::Failed => "failed",
+    }
+}
+
+fn short_id(id: &Uuid) -> String {
+    id.to_string().chars().take(8).collect()
+}
+
+fn human_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    const TB: u64 = GB * 1024;
+    if n >= TB {
+        format!("{:.2} TB", n as f64 / TB as f64)
+    } else if n >= GB {
+        format!("{:.2} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.2} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{n} B")
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+

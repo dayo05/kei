@@ -1,0 +1,60 @@
+# Kei (Kickstart Environment Integrator) example configuration.
+# Copy to `kei.toml` and edit, or set KEI_CONFIG=/path/to/kei.toml.
+
+[server]
+host = "0.0.0.0"
+port = 5050
+
+[storage]
+workspace_dir = "./data/workspaces"   # one subdir per project; force-synced from origin
+artifacts_dir = "./data/artifacts"    # served read-only at /artifacts/...
+
+[github]
+# Shared secret configured in the repo's webhook settings.
+# If unset, signature verification is skipped (NOT recommended in production).
+webhook_secret = "change-me"
+
+# Nix integration. When enabled, each step is wrapped as:
+#   nix develop ${flake}#${shell} ${extra_args...} -c <command> <args...>
+# Per-step `use_nix = false` opts out, `nix_shell = "..."` selects a different
+# devShell. `command = [...]` fully overrides the wrapper (e.g. for nix-shell).
+[nix]
+enabled = false
+flake = "."             # flake reference; "." = the cloned project workspace
+shell = "default"       # devShell attribute name
+extra_args = []         # passed to `nix develop` before `-c`
+# command = ["nix-shell", "--run"]   # full override; use for non-flake projects
+
+# One [[projects]] block per repo Kei should build. Match webhooks via
+# `github_full_name` (the "owner/repo" string in the push payload).
+[[projects]]
+name = "demo"
+repo_url = "https://github.com/owner/repo.git"
+branch = "main"
+github_full_name = "owner/repo"
+# Per-project nix overrides (any field omitted falls back to [nix]).
+nix.shell = "ci"
+
+[[projects.steps]]
+name = "build"
+command = "./gradlew"
+args = ["clean", "build"]
+
+[[projects.steps]]
+name = "stage-extras"
+command = "cp"
+args = ["-r", "extras/", "build/libs/extras"]
+use_nix = false                       # plain coreutils — no flake needed
+
+[[projects.artifacts]]
+pattern = "build/libs/*.jar"
+
+[[projects.artifacts]]
+pattern = "build/distributions/*.zip"
+
+# Optional `suffix` flattens to the artifact root and splices the suffix
+# before the extension. `{build_number}` is replaced with the per-project
+# monotonic build counter (persisted at <artifacts>/<project>/.build_number).
+#   pattern = "fabric/build/libs/*.jar"
+#   suffix  = "fabric-b{build_number}"
+#                   # aris-1.1.0.jar -> aris-1.1.0-fabric-b42.jar

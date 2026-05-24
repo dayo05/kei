@@ -1,0 +1,33 @@
+[package]
+name = "kei"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# `discord` pulls in reqwest + rustls for outbound webhook POSTs. With the
+# feature off, [[projects.notify.discord]] entries are accepted in config but
+# silently ignored — useful for slim builds that don't need outbound HTTP.
+# `maven` enables the /maven HTTP route that serves a Maven repository
+# from the configured `[maven].repo_dir`. Projects opt in by adding a
+# `publishToMavenLocal` step with `-Dmaven.repo.local=$KEI_MAVEN_REPO`.
+default = []
+discord = ["dep:reqwest"]
+maven = []
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["fs", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+glob = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
