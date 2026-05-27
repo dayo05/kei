@@ -219,6 +219,11 @@ pub struct StepConfig {
     /// conflict with the main build's).
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// Hard wall-clock limit in seconds. When the step exceeds this, kei
+    /// SIGKILLs the process and the build fails. Unset = no limit (the
+    /// step can hang forever, holding the global build lock).
+    #[serde(default)]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

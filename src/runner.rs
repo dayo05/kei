@@ -77,7 +77,8 @@ pub async fn run_step(
     let stderr = child.stderr.take().expect("piped");
 
     let tx_out = log_sink.clone();
-    let tx_err = log_sink;
+    let tx_err = log_sink.clone();
+    let tx_main = log_sink;
 
     let h_out = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
@@ -92,7 +93,27 @@ pub async fn run_step(
         }
     });
 
-    let status = child.wait().await?;
+    let status = match step.timeout {
+        Some(secs) => {
+            let dur = std::time::Duration::from_secs(secs);
+            match tokio::time::timeout(dur, child.wait()).await {
+                Ok(s) => s?,
+                Err(_) => {
+                    // Wait future dropped → mut borrow released → kill is safe.
+                    let _ = tx_main.send(format!(
+                        "\n[timeout] step '{}' exceeded {secs}s, killing\n",
+                        step.name
+                    ));
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    let _ = h_out.await;
+                    let _ = h_err.await;
+                    anyhow::bail!("step '{}' timed out after {secs}s", step.name);
+                }
+            }
+        }
+        None => child.wait().await?,
+    };
     let _ = h_out.await;
     let _ = h_err.await;
 

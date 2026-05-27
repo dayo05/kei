@@ -244,13 +244,14 @@ pub async fn maven_handler(
     serve_tree(root, "/maven", uri).await
 }
 
-async fn serve_tree(mut fs_path: std::path::PathBuf, prefix: &str, uri: Uri) -> Response {
+async fn serve_tree(root: std::path::PathBuf, prefix: &str, uri: Uri) -> Response {
     let raw_path = uri.path();
     let rel = raw_path
         .strip_prefix(prefix)
         .unwrap_or("")
         .trim_start_matches('/');
 
+    let mut fs_path = root.clone();
     if !rel.is_empty() {
         // Reject path traversal — only accept clean, non-empty segments.
         for seg in rel.trim_end_matches('/').split('/') {
@@ -261,13 +262,28 @@ async fn serve_tree(mut fs_path: std::path::PathBuf, prefix: &str, uri: Uri) -> 
         }
     }
 
-    let meta = match tokio::fs::metadata(&fs_path).await {
+    // Resolve symlinks in both root and target, then verify target stays
+    // under root. Without this, a symlink inside an artifact directory
+    // (e.g. planted by a malicious build step) could escape to /etc.
+    let canonical_root = match tokio::fs::canonicalize(&root).await {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    };
+    let canonical = match tokio::fs::canonicalize(&fs_path).await {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    };
+    if !canonical.starts_with(&canonical_root) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+
+    let meta = match tokio::fs::metadata(&canonical).await {
         Ok(m) => m,
         Err(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
 
     if meta.is_file() {
-        return serve_file(&fs_path, meta.len()).await;
+        return serve_file(&canonical, meta.len()).await;
     }
     if !meta.is_dir() {
         return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -277,10 +293,14 @@ async fn serve_tree(mut fs_path: std::path::PathBuf, prefix: &str, uri: Uri) -> 
         return Redirect::permanent(&format!("{raw_path}/")).into_response();
     }
 
-    render_directory(&fs_path, rel).await
+    render_directory(&canonical, rel, &canonical_root).await
 }
 
-async fn render_directory(fs_path: &std::path::Path, rel: &str) -> Response {
+async fn render_directory(
+    fs_path: &std::path::Path,
+    rel: &str,
+    canonical_root: &std::path::Path,
+) -> Response {
     let mut rd = match tokio::fs::read_dir(fs_path).await {
         Ok(r) => r,
         Err(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
@@ -290,6 +310,20 @@ async fn render_directory(fs_path: &std::path::Path, rel: &str) -> Response {
         let name = e.file_name().to_string_lossy().to_string();
         if name.starts_with('.') {
             continue;
+        }
+        // Hide symlinks whose target escapes the artifact root — a malicious
+        // build step could plant `evil -> /etc/passwd` and a listing would
+        // otherwise reveal its size/mtime. serve_tree blocks the actual
+        // fetch, but we don't want the link visible at all.
+        let link_meta = match tokio::fs::symlink_metadata(e.path()).await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if link_meta.file_type().is_symlink() {
+            match tokio::fs::canonicalize(e.path()).await {
+                Ok(c) if c.starts_with(canonical_root) => {}
+                _ => continue,
+            }
         }
         // Follow symlinks (the per-project `latest` link points at a build
         // directory) so size and is_dir reflect the target, not the link.
@@ -353,15 +387,19 @@ async fn render_directory(fs_path: &std::path::Path, rel: &str) -> Response {
 }
 
 async fn serve_file(fs_path: &std::path::Path, size: u64) -> Response {
-    let bytes = match tokio::fs::read(fs_path).await {
-        Ok(b) => b,
+    // Stream the file instead of buffering it. tokio::fs::read previously
+    // pulled the whole jar into RAM, so a multi-GB artifact (or many
+    // concurrent requests for one) translated directly into RSS pressure.
+    let file = match tokio::fs::File::open(fs_path).await {
+        Ok(f) => f,
         Err(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
-    let mime = mime_for(fs_path);
-    let mut resp = (StatusCode::OK, bytes).into_response();
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = axum::body::Body::from_stream(stream);
+    let mut resp = body.into_response();
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static(mime),
+        HeaderValue::from_static(mime_for(fs_path)),
     );
     if let Ok(v) = HeaderValue::from_str(&size.to_string()) {
         resp.headers_mut().insert(header::CONTENT_LENGTH, v);

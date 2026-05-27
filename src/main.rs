@@ -2,6 +2,7 @@ use anyhow::Result;
 use axum::Router;
 use axum::response::Redirect;
 use axum::routing::{get, post};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::layer::SubscriberExt;
@@ -29,6 +30,13 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| PathBuf::from("kei.toml"));
     tracing::info!(config = %cfg_path.display(), "loading config");
     let cfg = config::Config::load(&cfg_path)?;
+
+    if cfg.github.webhook_secret.is_none() {
+        tracing::warn!(
+            "github.webhook_secret is unset — /webhook accepts unsigned \
+             requests; anyone who can reach the endpoint can trigger builds"
+        );
+    }
 
     tokio::fs::create_dir_all(&cfg.storage.workspace_dir).await?;
     tokio::fs::create_dir_all(&cfg.storage.artifacts_dir).await?;
@@ -100,7 +108,12 @@ async fn main() -> Result<()> {
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "kei listening");
-    axum::serve(listener, app).await?;
+    // ConnectInfo<SocketAddr> needed so the trigger route can gate by peer IP.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
