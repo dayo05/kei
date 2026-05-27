@@ -12,8 +12,6 @@ pub async fn index() -> Response {
         r#"<h1>Kei</h1>
 <ul class="nav">
   <li><a href="/builds">Builds</a></li>
-  <li><a href="/api/projects">Projects (JSON)</a></li>
-  <li><a href="/api/artifacts">Artifacts (JSON)</a></li>
   <li><a href="/artifacts/">Artifact files</a></li>
 </ul>"#,
     );
