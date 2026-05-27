@@ -39,6 +39,10 @@ nix.shell = "ci"
 name = "build"
 command = "./gradlew"
 args = ["clean", "build"]
+# Optional wall-clock cap in seconds. If unset, the step can run forever
+# and a hang holds the global build lock — every other project's webhook
+# stalls behind it. SIGKILL is delivered on expiry; the build fails.
+timeout = 1800
 
 [[projects.steps]]
 name = "stage-extras"
