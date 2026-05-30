@@ -59,12 +59,8 @@ pub fn require_project_access(
     if can_view_project(principal, project) {
         return Ok(());
     }
-    let status = if principal.is_some() {
-        StatusCode::FORBIDDEN
-    } else {
-        StatusCode::UNAUTHORIZED
-    };
-    Err(ApiError::new(status, "project access denied"))
+    let _ = principal;
+    Err(ApiError::new(StatusCode::NOT_FOUND, "not found"))
 }
 
 #[cfg_attr(not(feature = "maven"), allow(dead_code))]
@@ -84,12 +80,8 @@ pub fn require_project_maven_access(
     if can_view_project_maven(principal, project) {
         return Ok(());
     }
-    let status = if principal.is_some() {
-        StatusCode::FORBIDDEN
-    } else {
-        StatusCode::UNAUTHORIZED
-    };
-    Err(ApiError::new(status, "maven access denied"))
+    let _ = principal;
+    Err(ApiError::new(StatusCode::NOT_FOUND, "not found"))
 }
 
 pub fn visible_projects<'a>(
