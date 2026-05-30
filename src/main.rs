@@ -10,6 +10,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod artifacts;
+mod auth;
 mod build;
 mod config;
 mod error;
@@ -91,9 +92,16 @@ async fn main() -> Result<()> {
         // ServeDir + nest_service had two interaction bugs in this version:
         // the directory-fallback status got pinned to 404, and the trailing-
         // slash redirect lost the `/artifacts` prefix.
-        .route("/artifacts", get(|| async { Redirect::permanent("/artifacts/") }))
+        .route(
+            "/artifacts",
+            get(|| async { Redirect::permanent("/artifacts/") }),
+        )
         .route("/artifacts/", get(views::artifacts_handler))
-        .route("/artifacts/*path", get(views::artifacts_handler));
+        .route("/artifacts/*path", get(views::artifacts_handler))
+        .route(
+            "/public/artifacts/*path",
+            get(views::public_artifact_handler),
+        );
 
     #[cfg(feature = "maven")]
     let app = app
@@ -101,9 +109,7 @@ async fn main() -> Result<()> {
         .route("/maven/", get(views::maven_handler))
         .route("/maven/*path", get(views::maven_handler));
 
-    let app = app
-        .layer(TraceLayer::new_for_http())
-        .with_state(app_state);
+    let app = app.layer(TraceLayer::new_for_http()).with_state(app_state);
 
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

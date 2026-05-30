@@ -7,42 +7,77 @@ use std::net::{IpAddr, SocketAddr};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::build;
 use crate::error::ApiError;
 use crate::state::{AppState, ArtifactRef, BuildStatus};
+use crate::{auth, build};
 
 pub async fn health() -> Json<Value> {
     Json(json!({ "ok": true }))
 }
 
-pub async fn list_projects(State(state): State<AppState>) -> Json<Value> {
+pub async fn list_projects(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
+    let principal = auth::authenticate(&headers, &state.config);
     let names: Vec<&str> = state
         .config
         .projects
         .iter()
+        .filter(|p| auth::can_view_project(principal.as_ref(), p))
         .map(|p| p.name.as_str())
         .collect();
     Json(json!({ "projects": names }))
 }
 
-pub async fn list_builds(State(state): State<AppState>) -> Json<Vec<BuildStatus>> {
-    Json(state.list_builds().await)
+pub async fn list_builds(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<Vec<BuildStatus>> {
+    let principal = auth::authenticate(&headers, &state.config);
+    let builds = state
+        .list_builds()
+        .await
+        .into_iter()
+        .filter(|b| {
+            state
+                .config
+                .project(&b.project)
+                .is_some_and(|p| auth::can_view_project(principal.as_ref(), p))
+        })
+        .collect();
+    Json(builds)
 }
 
 pub async fn get_build(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<BuildStatus>, ApiError> {
-    state
+    let build = state
         .get_build(id)
         .await
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("build not found"))
+        .ok_or_else(|| ApiError::not_found("build not found"))?;
+    let project = state
+        .config
+        .project(&build.project)
+        .ok_or_else(|| ApiError::not_found("project not found"))?;
+    let principal = auth::authenticate(&headers, &state.config);
+    auth::require_project_access(principal.as_ref(), project)?;
+    Ok(Json(build))
 }
 
-pub async fn list_artifacts(State(state): State<AppState>) -> Json<Vec<ArtifactRef>> {
+pub async fn list_artifacts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<Vec<ArtifactRef>> {
+    let principal = auth::authenticate(&headers, &state.config);
     let mut out = Vec::new();
     for b in state.list_builds().await {
+        if !state
+            .config
+            .project(&b.project)
+            .is_some_and(|p| auth::can_view_project(principal.as_ref(), p))
+        {
+            continue;
+        }
         out.extend(b.artifacts);
     }
     Json(out)

@@ -44,6 +44,7 @@ pub async fn run_build(state: AppState, project_name: String) -> anyhow::Result<
             notify::discord_notify(
                 &project,
                 st.config.server.public_url.as_deref(),
+                st.config.auth.public_link_secret.as_deref(),
                 &build,
                 succeeded,
             )
@@ -90,8 +91,7 @@ async fn run_build_inner(
     state
         .update_build(build_id, |b| b.current_step = Some("git-sync".into()))
         .await;
-    let (sync_log, sync_result) =
-        git::sync(&project.repo_url, &project.branch, &workspace).await;
+    let (sync_log, sync_result) = git::sync(&project.repo_url, &project.branch, &workspace).await;
     state.append_log(build_id, &sync_log).await;
     let head = sync_result.context("git sync")?;
     state
@@ -137,20 +137,15 @@ async fn run_build_inner(
             }
         });
 
-        let outcome =
-            runner::run_step(step, &workspace, &state.config.nix, &build_cfg.nix, tx)
-                .await
-                .with_context(|| format!("run step {}", step.name))?;
+        let outcome = runner::run_step(step, &workspace, &state.config.nix, &build_cfg.nix, tx)
+            .await
+            .with_context(|| format!("run step {}", step.name))?;
         // Senders drop when run_step returns, so the drain task ends after
         // flushing any tail messages still in the channel.
         let _ = drain.await;
 
         if !outcome.success {
-            anyhow::bail!(
-                "step '{}' failed (exit {:?})",
-                step.name,
-                outcome.code
-            );
+            anyhow::bail!("step '{}' failed (exit {:?})", step.name, outcome.code);
         }
     }
 
@@ -220,9 +215,10 @@ async fn run_build_inner(
     // pushed a new commit (e.g. update-docs), record THAT as the last built
     // commit — otherwise bootstrap on the next restart would see the bot's
     // [skip ci] commit as "remote moved" and rebuild it.
-    let head_for_last = state.get_build(build_id).await.and_then(|b| {
-        b.docs_commit.clone().or(b.commit.clone())
-    });
+    let head_for_last = state
+        .get_build(build_id)
+        .await
+        .and_then(|b| b.docs_commit.clone().or(b.commit.clone()));
     if let Some(head) = head_for_last {
         state.set_last_built_commit(&project.name, &head).await;
     }
@@ -271,8 +267,7 @@ async fn update_latest_link(
     let target = build_id.to_string();
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         if std::fs::symlink_metadata(&link).is_ok() {
-            std::fs::remove_file(&link)
-                .or_else(|_| std::fs::remove_dir_all(&link))?;
+            std::fs::remove_file(&link).or_else(|_| std::fs::remove_dir_all(&link))?;
         }
         std::os::unix::fs::symlink(target, &link)
     })

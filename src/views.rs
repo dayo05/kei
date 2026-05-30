@@ -1,8 +1,9 @@
 use axum::extract::{Path, State};
-use axum::http::{HeaderValue, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use uuid::Uuid;
 
+use crate::auth;
 use crate::error::ApiError;
 use crate::state::{AppState, BuildState};
 
@@ -18,8 +19,19 @@ pub async fn index() -> Response {
     Html(body).into_response()
 }
 
-pub async fn list_builds(State(state): State<AppState>) -> Response {
-    let builds = state.list_builds().await;
+pub async fn list_builds(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = auth::authenticate(&headers, &state.config);
+    let builds: Vec<_> = state
+        .list_builds()
+        .await
+        .into_iter()
+        .filter(|b| {
+            state
+                .config
+                .project(&b.project)
+                .is_some_and(|p| auth::can_view_project(principal.as_ref(), p))
+        })
+        .collect();
     let mut rows = String::new();
     if builds.is_empty() {
         rows.push_str(r#"<tr><td colspan="5" class="muted">No builds yet.</td></tr>"#);
@@ -65,18 +77,28 @@ pub async fn list_builds(State(state): State<AppState>) -> Response {
 
 pub async fn build_detail(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
     let b = state
         .get_build(id)
         .await
         .ok_or_else(|| ApiError::not_found("build not found"))?;
+    let project = state
+        .config
+        .project(&b.project)
+        .ok_or_else(|| ApiError::not_found("project not found"))?;
+    let principal = auth::authenticate(&headers, &state.config);
+    auth::require_project_access(principal.as_ref(), project)?;
 
     let live = matches!(b.state, BuildState::Queued | BuildState::Running);
 
     let dur = match b.finished_at {
         Some(end) => format!("{}s", (end - b.started_at).num_seconds()),
-        None => format!("{}s (running)", (chrono::Utc::now() - b.started_at).num_seconds()),
+        None => format!(
+            "{}s (running)",
+            (chrono::Utc::now() - b.started_at).num_seconds()
+        ),
     };
 
     let mut artifacts_items = String::new();
@@ -226,9 +248,51 @@ pub async fn build_detail(
 /// slash redirect lost the `/artifacts` prefix because nest_service strips it.
 pub async fn artifacts_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    serve_tree(state.config.storage.artifacts_dir.clone(), "/artifacts", uri).await
+    let principal = auth::authenticate(&headers, &state.config);
+    let rel = tree_rel_path("/artifacts", uri.path());
+    let Some(project_name) = rel.split('/').next().filter(|s| !s.is_empty()) else {
+        return render_artifacts_root(&state, principal.as_ref()).await;
+    };
+    let Some(project) = state.config.project(project_name) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    if let Err(e) = auth::require_project_access(principal.as_ref(), project) {
+        return e.into_response();
+    }
+    serve_tree(
+        state.config.storage.artifacts_dir.clone(),
+        "/artifacts",
+        uri,
+        true,
+    )
+    .await
+}
+
+pub async fn public_artifact_handler(State(state): State<AppState>, uri: Uri) -> Response {
+    let rel = tree_rel_path("/public/artifacts", uri.path());
+    if rel.is_empty() || rel.ends_with('/') {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let Some(token) = query_param(uri.query(), "token") else {
+        return (StatusCode::UNAUTHORIZED, "missing token").into_response();
+    };
+    if !auth::verify_public_artifact_token(
+        state.config.auth.public_link_secret.as_deref(),
+        rel,
+        token,
+    ) {
+        return (StatusCode::FORBIDDEN, "bad token").into_response();
+    }
+    serve_tree(
+        state.config.storage.artifacts_dir.clone(),
+        "/public/artifacts",
+        uri,
+        false,
+    )
+    .await
 }
 
 /// Serves the configured Maven repository at `/maven/...`. Same file/dir
@@ -236,20 +300,49 @@ pub async fn artifacts_handler(
 #[cfg(feature = "maven")]
 pub async fn maven_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     uri: Uri,
 ) -> Response {
     let Some(root) = state.config.maven.repo_dir.clone() else {
         return (StatusCode::NOT_FOUND, "maven repo not configured").into_response();
     };
-    serve_tree(root, "/maven", uri).await
+    let rel = tree_rel_path("/maven", uri.path());
+    if let Some(project) = maven_project_for_path(&state, rel) {
+        let principal = auth::authenticate(&headers, &state.config);
+        if let Err(e) = auth::require_project_maven_access(principal.as_ref(), project) {
+            return e.into_response();
+        }
+    }
+    serve_tree(root, "/maven", uri, false).await
 }
 
-async fn serve_tree(root: std::path::PathBuf, prefix: &str, uri: Uri) -> Response {
+#[cfg(feature = "maven")]
+fn maven_project_for_path<'a>(
+    state: &'a AppState,
+    rel: &str,
+) -> Option<&'a crate::config::ProjectConfig> {
+    let segments: Vec<&str> = rel
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    state.config.projects.iter().find(|project| {
+        project
+            .maven
+            .artifacts
+            .iter()
+            .any(|artifact| segments.iter().any(|segment| segment == artifact))
+    })
+}
+
+async fn serve_tree(
+    root: std::path::PathBuf,
+    prefix: &str,
+    uri: Uri,
+    allow_directory_listing: bool,
+) -> Response {
     let raw_path = uri.path();
-    let rel = raw_path
-        .strip_prefix(prefix)
-        .unwrap_or("")
-        .trim_start_matches('/');
+    let rel = tree_rel_path(prefix, raw_path);
 
     let mut fs_path = root.clone();
     if !rel.is_empty() {
@@ -288,12 +381,57 @@ async fn serve_tree(root: std::path::PathBuf, prefix: &str, uri: Uri) -> Respons
     if !meta.is_dir() {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
+    if !allow_directory_listing {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
 
     if !raw_path.ends_with('/') {
         return Redirect::permanent(&format!("{raw_path}/")).into_response();
     }
 
     render_directory(&canonical, rel, &canonical_root).await
+}
+
+fn tree_rel_path<'a>(prefix: &str, raw_path: &'a str) -> &'a str {
+    raw_path
+        .strip_prefix(prefix)
+        .unwrap_or("")
+        .trim_start_matches('/')
+}
+
+fn query_param<'a>(query: Option<&'a str>, name: &str) -> Option<&'a str> {
+    query?.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (key == name).then_some(value)
+    })
+}
+
+async fn render_artifacts_root(state: &AppState, principal: Option<&auth::Principal>) -> Response {
+    let mut rows = String::new();
+    for project in auth::visible_projects(principal, &state.config) {
+        let dir = state.config.storage.artifacts_dir.join(&project.name);
+        if tokio::fs::metadata(&dir)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            let name = html_escape(&project.name);
+            rows.push_str(&format!(
+                r#"<tr><td><a href="{name}/">{name}/</a></td><td class="muted"></td><td class="muted"></td></tr>"#
+            ));
+        }
+    }
+    if rows.is_empty() {
+        rows.push_str(r#"<tr><td colspan="3" class="muted">No artifacts yet.</td></tr>"#);
+    }
+    let body = format!(
+        r#"<h1><a href="/">Kei</a> — Artifacts</h1>
+<table>
+  <thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead>
+  <tbody>{rows}</tbody>
+</table>"#
+    );
+    Html(page("Artifacts", &body)).into_response()
 }
 
 async fn render_directory(
@@ -443,6 +581,7 @@ fn workspace_for(state: &AppState, project: &str) -> Option<std::path::PathBuf> 
 
 pub async fn commit_view(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((project, sha)): Path<(String, String)>,
 ) -> Response {
     if !valid_sha(&sha) {
@@ -451,6 +590,13 @@ pub async fn commit_view(
     let Some(workspace) = workspace_for(&state, &project) else {
         return (StatusCode::NOT_FOUND, "no such project").into_response();
     };
+    let Some(project_cfg) = state.config.project(&project) else {
+        return (StatusCode::NOT_FOUND, "no such project").into_response();
+    };
+    let principal = auth::authenticate(&headers, &state.config);
+    if let Err(e) = auth::require_project_access(principal.as_ref(), project_cfg) {
+        return e.into_response();
+    }
     let info = match crate::git::show_commit(&workspace, &sha).await {
         Ok(i) => i,
         Err(_) => return (StatusCode::NOT_FOUND, "commit not found").into_response(),
@@ -481,7 +627,11 @@ pub async fn commit_view(
         stat = html_escape(&info.stat),
         diff_html = render_diff(&info.diff),
     );
-    Html(page(&format!("Commit {} · {}", short_str(&info.sha), project), &body)).into_response()
+    Html(page(
+        &format!("Commit {} · {}", short_str(&info.sha), project),
+        &body,
+    ))
+    .into_response()
 }
 
 /// Renders a unified diff as line-classified `<div>`s — GitHub-style
@@ -531,6 +681,7 @@ fn render_diff(text: &str) -> String {
 
 pub async fn compare_view(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((project, range)): Path<(String, String)>,
 ) -> Response {
     let (from, to) = match range.split_once("...") {
@@ -540,6 +691,13 @@ pub async fn compare_view(
     let Some(workspace) = workspace_for(&state, &project) else {
         return (StatusCode::NOT_FOUND, "no such project").into_response();
     };
+    let Some(project_cfg) = state.config.project(&project) else {
+        return (StatusCode::NOT_FOUND, "no such project").into_response();
+    };
+    let principal = auth::authenticate(&headers, &state.config);
+    if let Err(e) = auth::require_project_access(principal.as_ref(), project_cfg) {
+        return e.into_response();
+    }
     let commits = match crate::git::log_range(&workspace, &from, &to).await {
         Ok(c) => c,
         Err(_) => return (StatusCode::NOT_FOUND, "compare not available").into_response(),
@@ -575,7 +733,12 @@ pub async fn compare_view(
         count = commits.len(),
     );
     Html(page(
-        &format!("{} compare {}…{}", project, short_str(&from), short_str(&to)),
+        &format!(
+            "{} compare {}…{}",
+            project,
+            short_str(&from),
+            short_str(&to)
+        ),
         &body,
     ))
     .into_response()
@@ -587,12 +750,19 @@ fn short_str(sha: &str) -> String {
 
 pub async fn build_log_raw(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
     let b = state
         .get_build(id)
         .await
         .ok_or_else(|| ApiError::not_found("build not found"))?;
+    let project = state
+        .config
+        .project(&b.project)
+        .ok_or_else(|| ApiError::not_found("project not found"))?;
+    let principal = auth::authenticate(&headers, &state.config);
+    auth::require_project_access(principal.as_ref(), project)?;
     let mut resp = (StatusCode::OK, b.log).into_response();
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -721,4 +891,3 @@ fn html_escape(s: &str) -> String {
     }
     out
 }
-

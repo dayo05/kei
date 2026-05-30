@@ -7,15 +7,16 @@ use crate::state::BuildStatus;
 pub async fn discord_notify(
     project: &ProjectConfig,
     public_url: Option<&str>,
+    public_link_secret: Option<&str>,
     build: &BuildStatus,
     succeeded: bool,
 ) {
     #[cfg(feature = "discord")]
-    discord::send(project, public_url, build, succeeded).await;
+    discord::send(project, public_url, public_link_secret, build, succeeded).await;
 
     #[cfg(not(feature = "discord"))]
     {
-        let _ = (project, public_url, build, succeeded);
+        let _ = (project, public_url, public_link_secret, build, succeeded);
     }
 }
 
@@ -29,6 +30,7 @@ mod discord {
     pub async fn send(
         project: &ProjectConfig,
         public_url: Option<&str>,
+        public_link_secret: Option<&str>,
         build: &BuildStatus,
         succeeded: bool,
     ) {
@@ -50,7 +52,14 @@ mod discord {
             if !succeeded && !target.on_failure {
                 continue;
             }
-            let payload = build_payload(project, target, public_url, build, succeeded);
+            let payload = build_payload(
+                project,
+                target,
+                public_url,
+                public_link_secret,
+                build,
+                succeeded,
+            );
             let url = match &target.thread_id {
                 Some(tid) => format!("{}?thread_id={}&wait=true", target.url, tid),
                 None => format!("{}?wait=true", target.url),
@@ -78,6 +87,7 @@ mod discord {
         project: &ProjectConfig,
         target: &DiscordTarget,
         public_url: Option<&str>,
+        public_link_secret: Option<&str>,
         build: &BuildStatus,
         succeeded: bool,
     ) -> Value {
@@ -160,19 +170,25 @@ mod discord {
             desc.push_str("\n\n**Artifacts**");
             for a in &build.artifacts {
                 let size_mb = a.size as f64 / 1_048_576.0;
-                match public_url {
-                    Some(base) => desc.push_str(&format!(
+                match (public_url, public_link_secret, target.public_artifact_links) {
+                    (Some(base), Some(secret), true) => {
+                        let url = crate::auth::public_artifact_url(base, secret, &a.path);
+                        desc.push_str(&format!(
+                            "\n• [{}]({url}) ({:.2} MB)",
+                            basename(&a.path),
+                            size_mb
+                        ));
+                    }
+                    (Some(base), _, _) => desc.push_str(&format!(
                         "\n• [{}]({}{}) ({:.2} MB)",
                         basename(&a.path),
                         base,
                         a.url,
                         size_mb
                     )),
-                    None => desc.push_str(&format!(
-                        "\n• {} ({:.2} MB)",
-                        basename(&a.path),
-                        size_mb
-                    )),
+                    (None, _, _) => {
+                        desc.push_str(&format!("\n• {} ({:.2} MB)", basename(&a.path), size_mb))
+                    }
                 }
             }
         }

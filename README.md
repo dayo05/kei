@@ -76,9 +76,28 @@ custom wrapper, NixOS systemd module) is documented in [`nix.md`](./nix.md).
 | GET    | `/api/builds/:id`             | One build (status, current step, log, artifacts)     |
 | GET    | `/api/artifacts`              | Flat artifact list with download URLs                |
 | GET    | `/artifacts/<project>/<id>/…` | Static download (also `…/<project>/latest/…`)        |
+| GET    | `/public/artifacts/<project>/<id>/…?token=…` | Signed public artifact download |
 
 Build state is one of `queued | running | success | failed`. The full
 captured stdout/stderr of every step is exposed in `BuildStatus.log`.
+
+## Access control
+
+Projects are public by default. Set `visibility = "restricted"` and
+`allowed_accounts = ["name"]` on a project to require
+`Authorization: Bearer <token>` for that project's builds, logs, artifacts,
+commit view, and compare view. `visibility = "private"` restricts a project
+to admin accounts only.
+
+Discord artifact links can still be public for restricted projects by setting
+`public_artifact_links = true` on the Discord target and configuring
+`[auth].public_link_secret`. Those links use signed `/public/artifacts/...`
+URLs and only serve the exact artifact file.
+
+Maven artifacts are owned by project config via `maven.artifacts = [...]`.
+Public projects expose owned Maven artifacts publicly by default. Restricted
+and private projects keep owned Maven artifacts private by default; set
+`maven.public = true` on that project to allow public Maven downloads.
 
 ### GitHub webhook setup
 

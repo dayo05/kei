@@ -14,6 +14,16 @@ artifacts_dir = "./data/artifacts"    # served read-only at /artifacts/...
 # If unset, signature verification is skipped (NOT recommended in production).
 webhook_secret = "change-me"
 
+[auth]
+# Optional secret for signed public artifact links such as Discord webhook
+# downloads. Keep this private; changing it invalidates existing public links.
+public_link_secret = "change-me-too"
+
+[[auth.accounts]]
+name = "dayo"
+token = "paste-a-long-random-token"
+admin = true
+
 # Nix integration. When enabled, each step is wrapped as:
 #   nix develop ${flake}#${shell} ${extra_args...} -c <command> <args...>
 # Per-step `use_nix = false` opts out, `nix_shell = "..."` selects a different
@@ -32,8 +42,22 @@ name = "demo"
 repo_url = "https://github.com/owner/repo.git"
 branch = "main"
 github_full_name = "owner/repo"
+# public = current behavior. restricted = allowed_accounts/admins only.
+# private = admins only.
+visibility = "public"
+allowed_accounts = []
+# Maven artifact IDs owned by this project. Public projects default to public
+# Maven. Restricted/private projects default to private Maven unless
+# `maven.public = true`.
+maven.artifacts = ["demo"]
+# maven.public = true
 # Per-project nix overrides (any field omitted falls back to [nix]).
 nix.shell = "ci"
+
+# For Discord notifications on restricted projects, set this inside a
+# [[projects.notify.discord]] block so artifact links use signed public
+# download URLs under /public/artifacts/... instead of protected /artifacts/...
+# public_artifact_links = true
 
 [[projects.steps]]
 name = "build"

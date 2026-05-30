@@ -10,6 +10,8 @@ pub struct Config {
     #[serde(default)]
     pub github: GithubConfig,
     #[serde(default)]
+    pub auth: AuthConfig,
+    #[serde(default)]
     pub nix: NixConfig,
     /// Optional Maven repository serving. Only read when the `maven` cargo
     /// feature is enabled; harmless to configure in slim builds.
@@ -18,6 +20,25 @@ pub struct Config {
     pub maven: MavenConfig,
     #[serde(default)]
     pub projects: Vec<ProjectConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AuthConfig {
+    /// Secret used to sign unauthenticated artifact download links, such as
+    /// links posted to Discord webhooks. When unset, public artifact links are
+    /// not generated and `/public/artifacts/...` rejects requests.
+    #[serde(default)]
+    pub public_link_secret: Option<String>,
+    #[serde(default)]
+    pub accounts: Vec<AuthAccount>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AuthAccount {
+    pub name: String,
+    pub token: String,
+    #[serde(default)]
+    pub admin: bool,
 }
 
 #[cfg_attr(not(feature = "maven"), allow(dead_code))]
@@ -55,8 +76,12 @@ impl Default for ServerConfig {
     }
 }
 
-fn default_host() -> String { "0.0.0.0".into() }
-fn default_port() -> u16 { 5050 }
+fn default_host() -> String {
+    "0.0.0.0".into()
+}
+fn default_port() -> u16 {
+    5050
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct StorageConfig {
@@ -75,8 +100,12 @@ impl Default for StorageConfig {
     }
 }
 
-fn default_workspace() -> PathBuf { PathBuf::from("./data/workspaces") }
-fn default_artifacts() -> PathBuf { PathBuf::from("./data/artifacts") }
+fn default_workspace() -> PathBuf {
+    PathBuf::from("./data/workspaces")
+}
+fn default_artifacts() -> PathBuf {
+    PathBuf::from("./data/artifacts")
+}
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct GithubConfig {
@@ -113,8 +142,12 @@ impl Default for NixConfig {
     }
 }
 
-fn default_flake() -> String { ".".into() }
-fn default_shell() -> String { "default".into() }
+fn default_flake() -> String {
+    ".".into()
+}
+fn default_shell() -> String {
+    "default".into()
+}
 
 /// Per-project overrides for nix settings. Each `Some(_)` field replaces the
 /// global `[nix]` value for steps in this project.
@@ -141,6 +174,13 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub nix: ProjectNixOverride,
     #[serde(default)]
+    pub visibility: Visibility,
+    #[serde(default)]
+    pub allowed_accounts: Vec<String>,
+    #[cfg_attr(not(feature = "maven"), allow(dead_code))]
+    #[serde(default)]
+    pub maven: ProjectMavenConfig,
+    #[serde(default)]
     pub steps: Vec<StepConfig>,
     #[serde(default)]
     pub artifacts: Vec<ArtifactConfig>,
@@ -148,6 +188,30 @@ pub struct ProjectConfig {
     #[cfg_attr(not(feature = "discord"), allow(dead_code))]
     #[serde(default)]
     pub notify: NotifyConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Visibility {
+    #[default]
+    Public,
+    Restricted,
+    Private,
+}
+
+#[cfg_attr(not(feature = "maven"), allow(dead_code))]
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ProjectMavenConfig {
+    /// Maven artifact IDs owned by this project, such as `aris-db-fabric`.
+    /// Requests under `/maven/.../<artifact-id>/...` inherit this project's
+    /// visibility policy.
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+    /// Whether this project's Maven artifacts are public even when the
+    /// project itself is restricted. Public projects default to public Maven;
+    /// restricted/private projects default to private Maven.
+    #[serde(default)]
+    pub public: Option<bool>,
 }
 
 /// Per-project notification targets. Currently Discord webhooks only.
@@ -184,6 +248,11 @@ pub struct DiscordTarget {
     /// Include the artifact list with download links.
     #[serde(default = "default_true")]
     pub include_artifacts: bool,
+    /// Use signed unauthenticated artifact download URLs in the embed. Useful
+    /// when a project is restricted but Discord users still need one-click
+    /// artifact downloads. Requires `[auth].public_link_secret`.
+    #[serde(default)]
+    pub public_artifact_links: bool,
     /// Optional title template. Variables: `{project}`, `{number}`,
     /// `{status}` (succeeded|failed). Default:
     /// `"{project} #{number} {status}"`.
@@ -199,7 +268,9 @@ fn default_true() -> bool {
     true
 }
 
-fn default_branch() -> String { "main".into() }
+fn default_branch() -> String {
+    "main".into()
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct StepConfig {
@@ -263,8 +334,8 @@ impl ProjectBuildConfig {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(anyhow::anyhow!("reading {}: {e}", path.display())),
         };
-        let cfg: ProjectBuildConfig = toml::from_str(&s)
-            .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
+        let cfg: ProjectBuildConfig =
+            toml::from_str(&s).map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
         Ok(Some(cfg))
     }
 }
