@@ -86,18 +86,18 @@ captured stdout/stderr of every step is exposed in `BuildStatus.log`.
 Projects are public by default. Set `visibility = "restricted"` and
 `allowed_accounts = ["name"]` on a project to require
 `Authorization: Bearer <token>` for that project's builds, logs, artifacts,
-commit view, and compare view. `visibility = "private"` restricts a project
-to admin accounts only.
+commit view, and compare view. Browser users can also visit `/login`, enter
+their account name and token, and Kei will store the token in an HttpOnly
+cookie. `visibility = "private"` restricts a project to admin accounts only.
 
 Discord artifact links can still be public for restricted projects by setting
 `public_artifact_links = true` on the Discord target and configuring
 `[auth].public_link_secret`. Those links use signed `/public/artifacts/...`
 URLs and only serve the exact artifact file.
 
-Maven artifacts are owned by project config via `maven.artifacts = [...]`.
-Public projects expose owned Maven artifacts publicly by default. Restricted
-and private projects keep owned Maven artifacts private by default; set
-`maven.public = true` on that project to allow public Maven downloads.
+Maven artifacts are owned by project config via `maven.artifacts = [...]` and
+are public by default. Set `maven.public = false` on a project to require the
+same bearer token for its Maven artifact IDs.
 
 ### GitHub webhook setup
 

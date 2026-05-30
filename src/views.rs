@@ -1,6 +1,9 @@
-use axum::extract::{Path, State};
+use axum::Form;
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
+use serde::Deserialize;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::auth;
@@ -14,9 +17,52 @@ pub async fn index() -> Response {
 <ul class="nav">
   <li><a href="/builds">Builds</a></li>
   <li><a href="/artifacts/">Artifact files</a></li>
+  <li><a href="/login">Login</a></li>
 </ul>"#,
     );
     Html(body).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoginForm {
+    account: String,
+    token: String,
+    #[serde(default)]
+    next: String,
+}
+
+pub async fn login_form(Query(query): Query<HashMap<String, String>>) -> Response {
+    let next = sanitize_next(query.get("next").map(String::as_str).unwrap_or("/"));
+    Html(page("Login", &login_body(&next, None))).into_response()
+}
+
+pub async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
+    let next = sanitize_next(&form.next);
+    if auth::authenticate_login(&form.account, &form.token, &state.config).is_none() {
+        return Html(page(
+            "Login",
+            &login_body(&next, Some("Invalid account or token.")),
+        ))
+        .into_response();
+    }
+    let cookie = format!(
+        "kei_token={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000",
+        form.token
+    );
+    let mut response = Redirect::to(&next).into_response();
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    response
+}
+
+pub async fn logout() -> Response {
+    let mut response = Redirect::to("/").into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static("kei_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+    );
+    response
 }
 
 pub async fn list_builds(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -748,6 +794,31 @@ fn short_str(sha: &str) -> String {
     sha.chars().take(7).collect()
 }
 
+fn sanitize_next(next: &str) -> String {
+    if next.starts_with('/') && !next.starts_with("//") && !next.starts_with("/login") {
+        next.to_string()
+    } else {
+        "/".to_string()
+    }
+}
+
+fn login_body(next: &str, error: Option<&str>) -> String {
+    let error_html = error
+        .map(|msg| format!(r#"<div class="error">{}</div>"#, html_escape(msg)))
+        .unwrap_or_default();
+    format!(
+        r#"<h1><a href="/">Kei</a> — Login</h1>
+{error_html}
+<form class="login" method="post" action="/login">
+  <input type="hidden" name="next" value="{next}">
+  <label>Account <input name="account" autocomplete="username" required autofocus></label>
+  <label>Token <input name="token" type="password" autocomplete="current-password" required></label>
+  <button type="submit">Login</button>
+</form>"#,
+        next = html_escape(next),
+    )
+}
+
 pub async fn build_log_raw(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -815,6 +886,14 @@ fn page(title: &str, body: &str) -> String {
              max-height: 70vh; }}
   .error {{ background: rgba(248,81,73,0.1); border: 1px solid var(--err);
             padding: 10px 14px; border-radius: 6px; margin: 12px 0; }}
+  form.login {{ max-width: 360px; display: grid; gap: 12px; }}
+  form.login label {{ display: grid; gap: 4px; color: var(--muted); }}
+  form.login input {{ width: 100%; background: var(--panel); color: var(--fg);
+                      border: 1px solid var(--border); border-radius: 6px;
+                      padding: 8px 10px; font: inherit; }}
+  form.login button {{ justify-self: start; background: var(--accent); color: #07111f;
+                       border: 0; border-radius: 6px; padding: 8px 14px;
+                       font: inherit; font-weight: 600; cursor: pointer; }}
   ul.artifacts {{ padding-left: 18px; }}
   a.raw {{ font-size: 0.75em; color: var(--muted); margin-left: 8px; }}
   .diff {{ background: var(--panel); border: 1px solid var(--border);

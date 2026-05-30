@@ -14,12 +14,24 @@ pub struct Principal {
 }
 
 pub fn authenticate(headers: &HeaderMap, config: &Config) -> Option<Principal> {
-    let token = bearer_token(headers)?;
+    let token = bearer_token(headers).or_else(|| cookie_token(headers))?;
     config
         .auth
         .accounts
         .iter()
         .find(|account| account.token == token)
+        .map(|account| Principal {
+            account: account.name.clone(),
+            admin: account.admin,
+        })
+}
+
+pub fn authenticate_login(account: &str, token: &str, config: &Config) -> Option<Principal> {
+    config
+        .auth
+        .accounts
+        .iter()
+        .find(|configured| configured.name == account && configured.token == token)
         .map(|account| Principal {
             account: account.name.clone(),
             admin: account.admin,
@@ -57,10 +69,7 @@ pub fn require_project_access(
 
 #[cfg_attr(not(feature = "maven"), allow(dead_code))]
 pub fn can_view_project_maven(principal: Option<&Principal>, project: &ProjectConfig) -> bool {
-    let maven_public = project
-        .maven
-        .public
-        .unwrap_or(matches!(project.visibility, Visibility::Public));
+    let maven_public = project.maven.public.unwrap_or(true);
     if maven_public {
         return true;
     }
@@ -130,5 +139,18 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn cookie_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|cookie| {
+                let (name, value) = cookie.trim().split_once('=')?;
+                (name == "kei_token").then_some(value)
+            })
+        })
         .filter(|s| !s.is_empty())
 }

@@ -46,11 +46,10 @@ github_full_name = "owner/repo"
 # private = admins only.
 visibility = "public"
 allowed_accounts = []
-# Maven artifact IDs owned by this project. Public projects default to public
-# Maven. Restricted/private projects default to private Maven unless
-# `maven.public = true`.
+# Maven artifact IDs owned by this project. Maven is public by default; set
+# `maven.public = false` to require the same bearer token used for the API.
 maven.artifacts = ["demo"]
-# maven.public = true
+# maven.public = false
 # Per-project nix overrides (any field omitted falls back to [nix]).
 nix.shell = "ci"
 

@@ -73,6 +73,8 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(views::index))
+        .route("/login", get(views::login_form).post(views::login_submit))
+        .route("/logout", post(views::logout))
         .route("/health", get(routes::health))
         .route("/webhook", post(webhook::handle))
         .route("/api/projects", get(routes::list_projects))
