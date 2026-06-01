@@ -876,6 +876,7 @@ fn page(title: &str, body: &str) -> String {
   .state.running {{ background: rgba(108,182,255,0.15); color: var(--run); }}
   .state.success {{ background: rgba(63,185,80,0.15); color: var(--ok); }}
   .state.failed {{ background: rgba(248,81,73,0.15); color: var(--err); }}
+  .state.canceled {{ background: rgba(210,153,34,0.15); color: var(--warn); }}
   dl.meta {{ display: grid; grid-template-columns: max-content 1fr; gap: 4px 18px; margin: 12px 0; }}
   dl.meta dt {{ color: var(--muted); }}
   dl.meta dd {{ margin: 0; }}
@@ -922,6 +923,7 @@ fn state_class(s: &BuildState) -> &'static str {
         BuildState::Running => "running",
         BuildState::Success => "success",
         BuildState::Failed => "failed",
+        BuildState::Canceled => "canceled",
     }
 }
 
@@ -931,6 +933,7 @@ fn state_label(s: &BuildState) -> &'static str {
         BuildState::Running => "running",
         BuildState::Success => "success",
         BuildState::Failed => "failed",
+        BuildState::Canceled => "canceled",
     }
 }
 

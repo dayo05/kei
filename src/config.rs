@@ -233,8 +233,8 @@ pub struct DiscordTarget {
     /// notification lands in a specific thread instead of the channel root.
     #[serde(default)]
     pub thread_id: Option<String>,
-    /// Whether to also notify on failed builds. Default false — only
-    /// successes ping the channel.
+    /// Deprecated. Terminal Discord notifications are always sent for
+    /// succeeded, failed, and canceled builds.
     #[serde(default)]
     pub on_failure: bool,
     /// Include a "Changes" link comparing the previous successful commit to
@@ -254,7 +254,7 @@ pub struct DiscordTarget {
     #[serde(default)]
     pub public_artifact_links: bool,
     /// Optional title template. Variables: `{project}`, `{number}`,
-    /// `{status}` (succeeded|failed). Default:
+    /// `{status}` (succeeded|failed|canceled). Default:
     /// `"{project} #{number} {status}"`.
     #[serde(default)]
     pub title: Option<String>,

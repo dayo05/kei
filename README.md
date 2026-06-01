@@ -78,7 +78,7 @@ custom wrapper, NixOS systemd module) is documented in [`nix.md`](./nix.md).
 | GET    | `/artifacts/<project>/<id>/…` | Static download (also `…/<project>/latest/…`)        |
 | GET    | `/public/artifacts/<project>/<id>/…?token=…` | Signed public artifact download |
 
-Build state is one of `queued | running | success | failed`. The full
+Build state is one of `queued | running | success | failed | canceled`. The full
 captured stdout/stderr of every step is exposed in `BuildStatus.log`.
 
 ## Access control

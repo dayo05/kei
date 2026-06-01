@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -15,6 +15,7 @@ pub enum BuildState {
     Running,
     Success,
     Failed,
+    Canceled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +56,7 @@ pub struct ArtifactRef {
 pub struct AppState {
     pub config: Arc<Config>,
     pub builds: Arc<RwLock<HashMap<Uuid, BuildStatus>>>,
+    pub cancellations: Arc<RwLock<HashMap<Uuid, watch::Sender<bool>>>>,
     /// Serialises every build across the whole server. Different projects
     /// can race on the shared ~/.gradle/caches/fabric-loom/<mc-version>/...
     /// state when they target the same Minecraft version; a global lock is
@@ -70,6 +72,7 @@ impl AppState {
         Self {
             config: Arc::new(config),
             builds: Arc::new(RwLock::new(HashMap::new())),
+            cancellations: Arc::new(RwLock::new(HashMap::new())),
             build_lock: Arc::new(Mutex::new(())),
             counter_lock: Arc::new(Mutex::new(())),
         }
@@ -92,9 +95,10 @@ impl AppState {
         next
     }
 
-    pub async fn create_build(&self, project: &str) -> Uuid {
+    pub async fn create_build(&self, project: &str) -> (Uuid, watch::Receiver<bool>) {
         let id = Uuid::new_v4();
         let number = self.next_build_number(project).await;
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         let status = BuildStatus {
             id,
             project: project.to_string(),
@@ -111,7 +115,33 @@ impl AppState {
             error: None,
         };
         self.builds.write().await.insert(id, status);
-        id
+        self.cancellations.write().await.insert(id, cancel_tx);
+        (id, cancel_rx)
+    }
+
+    pub async fn cancel_superseded_builds(&self, project: &str) -> Vec<Uuid> {
+        let ids: Vec<Uuid> = self
+            .builds
+            .read()
+            .await
+            .values()
+            .filter(|b| {
+                b.project == project && matches!(b.state, BuildState::Queued | BuildState::Running)
+            })
+            .map(|b| b.id)
+            .collect();
+
+        let cancellations = self.cancellations.read().await;
+        for id in &ids {
+            if let Some(tx) = cancellations.get(id) {
+                let _ = tx.send(true);
+            }
+        }
+        ids
+    }
+
+    pub async fn remove_cancellation(&self, id: Uuid) {
+        self.cancellations.write().await.remove(&id);
     }
 
     pub async fn update_build<F: FnOnce(&mut BuildStatus)>(&self, id: Uuid, f: F) {

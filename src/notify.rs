@@ -1,5 +1,5 @@
 use crate::config::ProjectConfig;
-use crate::state::BuildStatus;
+use crate::state::{BuildState, BuildStatus};
 
 /// Notify the project's Discord targets about a finished build. No-op when
 /// the `discord` cargo feature is disabled — the call site doesn't need to
@@ -9,14 +9,17 @@ pub async fn discord_notify(
     public_url: Option<&str>,
     public_link_secret: Option<&str>,
     build: &BuildStatus,
-    succeeded: bool,
 ) {
+    if matches!(build.state, BuildState::Queued | BuildState::Running) {
+        return;
+    }
+
     #[cfg(feature = "discord")]
-    discord::send(project, public_url, public_link_secret, build, succeeded).await;
+    discord::send(project, public_url, public_link_secret, build).await;
 
     #[cfg(not(feature = "discord"))]
     {
-        let _ = (project, public_url, public_link_secret, build, succeeded);
+        let _ = (project, public_url, public_link_secret, build);
     }
 }
 
@@ -24,6 +27,7 @@ pub async fn discord_notify(
 mod discord {
     use super::{BuildStatus, ProjectConfig};
     use crate::config::DiscordTarget;
+    use crate::state::BuildState;
     use serde_json::{Value, json};
     use tracing::{info, warn};
 
@@ -32,7 +36,6 @@ mod discord {
         public_url: Option<&str>,
         public_link_secret: Option<&str>,
         build: &BuildStatus,
-        succeeded: bool,
     ) {
         let targets = &project.notify.discord;
         if targets.is_empty() {
@@ -49,17 +52,7 @@ mod discord {
             }
         };
         for target in targets {
-            if !succeeded && !target.on_failure {
-                continue;
-            }
-            let payload = build_payload(
-                project,
-                target,
-                public_url,
-                public_link_secret,
-                build,
-                succeeded,
-            );
+            let payload = build_payload(project, target, public_url, public_link_secret, build);
             let url = match &target.thread_id {
                 Some(tid) => format!("{}?thread_id={}&wait=true", target.url, tid),
                 None => format!("{}?wait=true", target.url),
@@ -89,12 +82,12 @@ mod discord {
         public_url: Option<&str>,
         public_link_secret: Option<&str>,
         build: &BuildStatus,
-        succeeded: bool,
     ) -> Value {
-        let (status_word, color) = if succeeded {
-            ("succeeded", 0x3FB950)
-        } else {
-            ("failed", 0xF85149)
+        let (status_word, color) = match build.state {
+            BuildState::Success => ("succeeded", 0x3FB950),
+            BuildState::Failed => ("failed", 0xF85149),
+            BuildState::Canceled => ("canceled", 0xD29922),
+            BuildState::Queued | BuildState::Running => ("finished", 0x6CB6FF),
         };
         let title_tpl = target
             .title

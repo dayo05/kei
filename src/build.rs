@@ -1,11 +1,17 @@
 use anyhow::Context;
 use chrono::Utc;
+use tokio::sync::watch;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::{ProjectBuildConfig, ProjectConfig};
 use crate::state::{AppState, BuildState};
 use crate::{artifacts, git, notify, runner};
+
+enum BuildOutcome {
+    Success,
+    Canceled,
+}
 
 /// Register a new build for `project_name` and start it on a background task.
 /// Returns the new build id immediately — the caller (webhook or trigger
@@ -16,28 +22,57 @@ pub async fn run_build(state: AppState, project_name: String) -> anyhow::Result<
         .project(&project_name)
         .ok_or_else(|| anyhow::anyhow!("unknown project: {project_name}"))?
         .clone();
-    let build_id = state.create_build(&project_name).await;
+    for old_id in state.cancel_superseded_builds(&project_name).await {
+        state
+            .append_log(
+                old_id,
+                "\n[canceled] superseded by a newer build request for this project\n",
+            )
+            .await;
+        state
+            .update_build(old_id, |b| {
+                if matches!(b.state, BuildState::Queued) {
+                    b.state = BuildState::Canceled;
+                    b.finished_at = Some(Utc::now());
+                    b.current_step = None;
+                }
+            })
+            .await;
+        state.persist_build(old_id).await;
+    }
+
+    let (build_id, cancel_rx) = state.create_build(&project_name).await;
 
     let st = state.clone();
     tokio::spawn(async move {
-        let outcome = run_build_inner(st.clone(), build_id, &project).await;
-        let succeeded = if let Err(e) = &outcome {
-            warn!(error=%e, build=%build_id, "build error");
-            st.append_log(build_id, &format!("\n[error] {e:#}\n")).await;
-            st.update_build(build_id, |b| {
-                b.state = BuildState::Failed;
-                b.finished_at = Some(Utc::now());
-                b.error = Some(format!("{e:#}"));
-                b.current_step = None;
-            })
-            .await;
-            false
-        } else {
-            true
+        let outcome = run_build_inner(st.clone(), build_id, &project, cancel_rx).await;
+        match &outcome {
+            Ok(BuildOutcome::Success) => {}
+            Ok(BuildOutcome::Canceled) => {
+                st.update_build(build_id, |b| {
+                    b.state = BuildState::Canceled;
+                    b.finished_at.get_or_insert_with(Utc::now);
+                    b.current_step = None;
+                })
+                .await;
+                info!(build=%build_id, project=%project.name, "build canceled");
+            }
+            Err(e) => {
+                warn!(error=%e, build=%build_id, "build error");
+                st.append_log(build_id, &format!("\n[error] {e:#}\n")).await;
+                st.update_build(build_id, |b| {
+                    b.state = BuildState::Failed;
+                    b.finished_at = Some(Utc::now());
+                    b.error = Some(format!("{e:#}"));
+                    b.current_step = None;
+                })
+                .await;
+            }
         };
         // Persist to disk before notifying so the link in the Discord embed
         // (and the build list page) survive a restart.
         st.persist_build(build_id).await;
+        st.remove_cancellation(build_id).await;
 
         // Notifications are best-effort; never block or fail builds.
         if let Some(build) = st.get_build(build_id).await {
@@ -46,7 +81,6 @@ pub async fn run_build(state: AppState, project_name: String) -> anyhow::Result<
                 st.config.server.public_url.as_deref(),
                 st.config.auth.public_link_secret.as_deref(),
                 &build,
-                succeeded,
             )
             .await;
         }
@@ -59,7 +93,12 @@ async fn run_build_inner(
     state: AppState,
     build_id: Uuid,
     project: &ProjectConfig,
-) -> anyhow::Result<()> {
+    cancel_rx: watch::Receiver<bool>,
+) -> anyhow::Result<BuildOutcome> {
+    if *cancel_rx.borrow() {
+        return Ok(BuildOutcome::Canceled);
+    }
+
     // Serialize ALL builds: two projects targeting the same Minecraft
     // version race on the shared loom cache (~/.gradle/caches/fabric-loom/
     // <mc>/...mappings.tiny), so per-project locking isn't enough — we
@@ -67,6 +106,10 @@ async fn run_build_inner(
     // (the workspace can't be touched by two builds of the same project at
     // once, but if no two builds run concurrently at all, neither can).
     let _guard = state.build_lock.lock().await;
+
+    if *cancel_rx.borrow() {
+        return Ok(BuildOutcome::Canceled);
+    }
 
     // Snapshot the previous-success commit (if any) so the post-build
     // notification can include a compare link showing what changed.
@@ -137,15 +180,31 @@ async fn run_build_inner(
             }
         });
 
-        let outcome = runner::run_step(step, &workspace, &state.config.nix, &build_cfg.nix, tx)
-            .await
-            .with_context(|| format!("run step {}", step.name))?;
+        let outcome = runner::run_step(
+            step,
+            &workspace,
+            &state.config.nix,
+            &build_cfg.nix,
+            tx,
+            cancel_rx.clone(),
+        )
+        .await
+        .with_context(|| format!("run step {}", step.name))?;
         // Senders drop when run_step returns, so the drain task ends after
         // flushing any tail messages still in the channel.
         let _ = drain.await;
 
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(_) => return Ok(BuildOutcome::Canceled),
+        };
+
         if !outcome.success {
             anyhow::bail!("step '{}' failed (exit {:?})", step.name, outcome.code);
+        }
+
+        if *cancel_rx.borrow() {
+            return Ok(BuildOutcome::Canceled);
         }
     }
 
@@ -224,7 +283,7 @@ async fn run_build_inner(
     }
 
     info!(build=%build_id, project=%project.name, "build succeeded");
-    Ok(())
+    Ok(BuildOutcome::Success)
 }
 
 /// On startup, walk every configured project and trigger a build whenever the

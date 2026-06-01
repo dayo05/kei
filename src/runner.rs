@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{mpsc::UnboundedSender, watch};
 
 use crate::config::{NixConfig, ProjectNixOverride, StepConfig};
 
@@ -11,6 +11,17 @@ pub struct StepOutcome {
     pub success: bool,
     pub code: Option<i32>,
 }
+
+#[derive(Debug)]
+pub struct StepCanceled;
+
+impl std::fmt::Display for StepCanceled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "step canceled")
+    }
+}
+
+impl std::error::Error for StepCanceled {}
 
 /// Run a configured step inside the workspace. When nix is enabled, the
 /// command is wrapped as `nix develop <flake>#<shell> [extra_args...] -c
@@ -27,17 +38,15 @@ pub async fn run_step(
     nix: &NixConfig,
     project_nix: &ProjectNixOverride,
     log_sink: UnboundedSender<String>,
-) -> Result<StepOutcome> {
+    mut cancel_rx: watch::Receiver<bool>,
+) -> Result<Result<StepOutcome, StepCanceled>> {
     let cwd = match &step.cwd {
         Some(p) if p.is_absolute() => p.clone(),
         Some(p) => workspace.join(p),
         None => workspace.to_path_buf(),
     };
 
-    let enabled = step
-        .use_nix
-        .or(project_nix.enabled)
-        .unwrap_or(nix.enabled);
+    let enabled = step.use_nix.or(project_nix.enabled).unwrap_or(nix.enabled);
 
     let (program, args) = if enabled {
         let wrapper = build_nix_wrapper(nix, project_nix, step);
@@ -51,15 +60,8 @@ pub async fn run_step(
         (step.command.clone(), step.args.clone())
     };
 
-    let env_preview: String = step
-        .env
-        .iter()
-        .map(|(k, v)| format!("{k}={v} "))
-        .collect();
-    let _ = log_sink.send(format!(
-        "$ {env_preview}{program} {}\n",
-        args.join(" ")
-    ));
+    let env_preview: String = step.env.iter().map(|(k, v)| format!("{k}={v} ")).collect();
+    let _ = log_sink.send(format!("$ {env_preview}{program} {}\n", args.join(" ")));
 
     let mut cmd = Command::new(&program);
     cmd.args(&args)
@@ -69,9 +71,7 @@ pub async fn run_step(
     for (k, v) in &step.env {
         cmd.env(k, v);
     }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawn {program}"))?;
+    let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
 
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
@@ -93,34 +93,57 @@ pub async fn run_step(
         }
     });
 
-    let status = match step.timeout {
-        Some(secs) => {
-            let dur = std::time::Duration::from_secs(secs);
-            match tokio::time::timeout(dur, child.wait()).await {
-                Ok(s) => s?,
-                Err(_) => {
-                    // Wait future dropped → mut borrow released → kill is safe.
-                    let _ = tx_main.send(format!(
-                        "\n[timeout] step '{}' exceeded {secs}s, killing\n",
-                        step.name
-                    ));
+    let status = if let Some(secs) = step.timeout {
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(secs));
+        tokio::pin!(timeout);
+        tokio::select! {
+            s = child.wait() => s?,
+            _ = &mut timeout => {
+                let _ = tx_main.send(format!(
+                    "\n[timeout] step '{}' exceeded {secs}s, killing\n",
+                    step.name
+                ));
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let _ = h_out.await;
+                let _ = h_err.await;
+                anyhow::bail!("step '{}' timed out after {secs}s", step.name);
+            }
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    let _ = tx_main.send(format!("\n[canceled] step '{}' canceled, killing\n", step.name));
                     let _ = child.start_kill();
                     let _ = child.wait().await;
                     let _ = h_out.await;
                     let _ = h_err.await;
-                    anyhow::bail!("step '{}' timed out after {secs}s", step.name);
+                    return Ok(Err(StepCanceled));
                 }
+                child.wait().await?
             }
         }
-        None => child.wait().await?,
+    } else {
+        tokio::select! {
+            s = child.wait() => s?,
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    let _ = tx_main.send(format!("\n[canceled] step '{}' canceled, killing\n", step.name));
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    let _ = h_out.await;
+                    let _ = h_err.await;
+                    return Ok(Err(StepCanceled));
+                }
+                child.wait().await?
+            }
+        }
     };
     let _ = h_out.await;
     let _ = h_err.await;
 
-    Ok(StepOutcome {
+    Ok(Ok(StepOutcome {
         success: status.success(),
         code: status.code(),
-    })
+    }))
 }
 
 fn build_nix_wrapper(
@@ -141,11 +164,7 @@ fn build_nix_wrapper(
         .extra_args
         .as_deref()
         .unwrap_or(nix.extra_args.as_slice());
-    let mut argv: Vec<String> = vec![
-        "nix".into(),
-        "develop".into(),
-        format!("{flake}#{shell}"),
-    ];
+    let mut argv: Vec<String> = vec!["nix".into(), "develop".into(), format!("{flake}#{shell}")];
     argv.extend(extra.iter().cloned());
     argv.push("-c".into());
     argv
