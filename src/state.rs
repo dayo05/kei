@@ -140,6 +140,31 @@ impl AppState {
         ids
     }
 
+    pub async fn request_cancel_build(&self, id: Uuid, reason: &str) -> bool {
+        let cancel_sent = self
+            .cancellations
+            .read()
+            .await
+            .get(&id)
+            .is_some_and(|tx| tx.send(true).is_ok());
+
+        if cancel_sent {
+            let mut builds = self.builds.write().await;
+            if let Some(b) = builds.get_mut(&id)
+                && matches!(b.state, BuildState::Queued | BuildState::Running)
+            {
+                b.log.push_str(reason);
+                if matches!(b.state, BuildState::Queued) {
+                    b.state = BuildState::Canceled;
+                    b.finished_at = Some(Utc::now());
+                    b.current_step = None;
+                }
+            }
+        }
+
+        cancel_sent
+    }
+
     pub async fn remove_cancellation(&self, id: Uuid) {
         self.cancellations.write().await.remove(&id);
     }

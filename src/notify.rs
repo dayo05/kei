@@ -1,31 +1,33 @@
 use crate::config::ProjectConfig;
-use crate::state::{BuildState, BuildStatus};
+use crate::state::BuildStatus;
 
-/// Notify the project's Discord targets about a finished build. No-op when
-/// the `discord` cargo feature is disabled — the call site doesn't need to
-/// know whether the feature is compiled in.
+pub enum DiscordEvent {
+    Queued,
+    Started,
+    Finished,
+}
+
+/// Notify the project's Discord targets about a build event. No-op when the
+/// `discord` cargo feature is disabled.
 pub async fn discord_notify(
     project: &ProjectConfig,
     public_url: Option<&str>,
     public_link_secret: Option<&str>,
     build: &BuildStatus,
+    event: DiscordEvent,
 ) {
-    if matches!(build.state, BuildState::Queued | BuildState::Running) {
-        return;
-    }
-
     #[cfg(feature = "discord")]
-    discord::send(project, public_url, public_link_secret, build).await;
+    discord::send(project, public_url, public_link_secret, build, event).await;
 
     #[cfg(not(feature = "discord"))]
     {
-        let _ = (project, public_url, public_link_secret, build);
+        let _ = (project, public_url, public_link_secret, build, event);
     }
 }
 
 #[cfg(feature = "discord")]
 mod discord {
-    use super::{BuildStatus, ProjectConfig};
+    use super::{BuildStatus, DiscordEvent, ProjectConfig};
     use crate::config::DiscordTarget;
     use crate::state::BuildState;
     use serde_json::{Value, json};
@@ -36,6 +38,7 @@ mod discord {
         public_url: Option<&str>,
         public_link_secret: Option<&str>,
         build: &BuildStatus,
+        event: DiscordEvent,
     ) {
         let targets = &project.notify.discord;
         if targets.is_empty() {
@@ -52,7 +55,14 @@ mod discord {
             }
         };
         for target in targets {
-            let payload = build_payload(project, target, public_url, public_link_secret, build);
+            let payload = build_payload(
+                project,
+                target,
+                public_url,
+                public_link_secret,
+                build,
+                &event,
+            );
             let url = match &target.thread_id {
                 Some(tid) => format!("{}?thread_id={}&wait=true", target.url, tid),
                 None => format!("{}?wait=true", target.url),
@@ -82,6 +92,7 @@ mod discord {
         public_url: Option<&str>,
         public_link_secret: Option<&str>,
         build: &BuildStatus,
+        event: &DiscordEvent,
     ) -> Value {
         let (status_word, color) = match build.state {
             BuildState::Success => ("succeeded", 0x3FB950),
@@ -89,14 +100,19 @@ mod discord {
             BuildState::Canceled => ("canceled", 0xD29922),
             BuildState::Queued | BuildState::Running => ("finished", 0x6CB6FF),
         };
+        let (event_word, event_color, default_title) = match event {
+            DiscordEvent::Queued => ("pending", 0xD29922, "{project} #{number} pending"),
+            DiscordEvent::Started => ("started", 0x6CB6FF, "{project} #{number} started"),
+            DiscordEvent::Finished => (status_word, color, "{project} #{number} {status}"),
+        };
         let title_tpl = target
             .title
             .clone()
-            .unwrap_or_else(|| "{project} #{number} {status}".to_string());
+            .unwrap_or_else(|| default_title.to_string());
         let title = title_tpl
             .replace("{project}", &build.project)
             .replace("{number}", &build.number.to_string())
-            .replace("{status}", status_word);
+            .replace("{status}", event_word);
 
         let short_commit = build
             .commit
@@ -113,45 +129,87 @@ mod discord {
             desc.push('\n');
         }
 
-        // Built commit, linked to kei's own commit view. Kei serves these
-        // from the local workspace, so they work for private repos that a
-        // GitHub link couldn't reach without auth.
+        if let Some(url) = build_url(public_url, public_link_secret, build) {
+            let label = match event {
+                DiscordEvent::Queued | DiscordEvent::Started => "Build",
+                DiscordEvent::Finished => "Result",
+            };
+            desc.push_str(&format!("**{label}:** [Open build]({url})\n"));
+        }
+
         match (public_url, build.commit.as_deref()) {
             (Some(base), Some(commit)) => desc.push_str(&format!(
-                "**Commit:** [`{short_commit}`]({base}/commits/{project}/{commit})",
-                project = project.name,
+                "**Commit:** [`{short_commit}`]({})",
+                path_url(
+                    base,
+                    public_link_secret,
+                    &format!("/commits/{project}/{commit}", project = project.name),
+                )
             )),
             _ => desc.push_str(&format!("**Commit:** `{short_commit}`")),
         }
 
-        // Compare link to the previous successful build's commit.
-        if target.include_changes {
-            if let (Some(base), Some(from), Some(to)) = (
+        match event {
+            DiscordEvent::Queued => {
+                desc.push_str("\n**State:** waiting for another build to finish");
+                return event_payload(
+                    title,
+                    desc,
+                    event_color,
+                    build.started_at,
+                    public_url,
+                    public_link_secret,
+                    build,
+                );
+            }
+            DiscordEvent::Started => {
+                desc.push_str("\n**State:** build is running");
+                return event_payload(
+                    title,
+                    desc,
+                    event_color,
+                    build.started_at,
+                    public_url,
+                    public_link_secret,
+                    build,
+                );
+            }
+            DiscordEvent::Finished => {}
+        }
+
+        if target.include_changes
+            && let (Some(base), Some(from), Some(to)) = (
                 public_url,
                 build.previous_commit.as_deref(),
                 build.commit.as_deref(),
-            ) {
-                if from != to {
-                    let from_short: String = from.chars().take(7).collect();
-                    desc.push_str(&format!(
-                        "\n**Changes:** [{from_short}…{short_commit}]({base}/compare/{project}/{from}...{to})",
-                        project = project.name,
-                    ));
-                }
-            }
+            )
+            && from != to
+        {
+            let from_short: String = from.chars().take(7).collect();
+            desc.push_str(&format!(
+                "\n**Changes:** [{from_short}…{short_commit}]({})",
+                path_url(
+                    base,
+                    public_link_secret,
+                    &format!("/compare/{project}/{from}...{to}", project = project.name),
+                )
+            ));
         }
 
-        // Docs commit pushed by a build step (e.g. update-docs).
-        if target.include_docs_commit {
-            if let Some(docs) = build.docs_commit.as_deref() {
-                let docs_short: String = docs.chars().take(7).collect();
-                match public_url {
-                    Some(base) => desc.push_str(&format!(
-                        "\n**Docs:** [`{docs_short}`]({base}/commits/{project}/{docs})",
-                        project = project.name,
-                    )),
-                    None => desc.push_str(&format!("\n**Docs:** `{docs_short}`")),
-                }
+        if target.include_docs_commit
+            && let Some(docs) = build.docs_commit.as_deref()
+        {
+            let docs_short: String = docs.chars().take(7).collect();
+            match public_url {
+                Some(base) => desc.push_str(&format!(
+                    "\n**Docs:** [`{docs_short}`]({})",
+                    path_url(
+                        base,
+                        public_link_secret,
+                        &format!("/commits/{project}/{docs}", project = project.name),
+                    )
+                )),
+                None => desc.push_str(&format!("\n**Docs:** `{docs_short}`")),
             }
         }
 
@@ -172,11 +230,10 @@ mod discord {
                             size_mb
                         ));
                     }
-                    (Some(base), _, _) => desc.push_str(&format!(
-                        "\n• [{}]({}{}) ({:.2} MB)",
+                    (Some(base), secret, _) => desc.push_str(&format!(
+                        "\n• [{}]({}) ({:.2} MB)",
                         basename(&a.path),
-                        base,
-                        a.url,
+                        path_url(base, secret, &a.url),
                         size_mb
                     )),
                     (None, _, _) => {
@@ -186,17 +243,55 @@ mod discord {
             }
         }
 
+        event_payload(
+            title,
+            desc,
+            color,
+            build.finished_at.unwrap_or(build.started_at),
+            public_url,
+            public_link_secret,
+            build,
+        )
+    }
+
+    fn event_payload(
+        title: String,
+        description: String,
+        color: u32,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        public_url: Option<&str>,
+        public_link_secret: Option<&str>,
+        build: &BuildStatus,
+    ) -> Value {
         let mut embed = json!({
             "title": title,
-            "description": desc,
+            "description": description,
             "color": color,
-            "timestamp": build.finished_at.unwrap_or(build.started_at).to_rfc3339(),
+            "timestamp": timestamp.to_rfc3339(),
         });
-        if let Some(base) = public_url {
-            embed["url"] = Value::String(format!("{base}/builds/{}", build.id));
+        if let Some(url) = build_url(public_url, public_link_secret, build) {
+            embed["url"] = Value::String(url);
         }
-
         json!({ "embeds": [embed] })
+    }
+
+    fn build_url(
+        public_url: Option<&str>,
+        public_link_secret: Option<&str>,
+        build: &BuildStatus,
+    ) -> Option<String> {
+        let base = public_url?;
+        Some(match public_link_secret {
+            Some(secret) => crate::auth::public_build_url(base, secret, build.id),
+            None => format!("{base}/builds/{}", build.id),
+        })
+    }
+
+    fn path_url(base: &str, secret: Option<&str>, path: &str) -> String {
+        match secret {
+            Some(secret) => crate::auth::public_path_url(base, secret, path),
+            None => format!("{base}{path}"),
+        }
     }
 
     fn basename(path: &str) -> &str {

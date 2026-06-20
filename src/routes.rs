@@ -1,14 +1,15 @@
 use axum::Json;
-use axum::extract::{ConnectInfo, Path, State};
-use axum::http::HeaderMap;
+use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::state::{AppState, ArtifactRef, BuildStatus};
+use crate::state::{AppState, ArtifactRef, BuildState, BuildStatus};
 use crate::{auth, build};
 
 pub async fn health() -> Json<Value> {
@@ -49,6 +50,7 @@ pub async fn list_builds(
 pub async fn get_build(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<BuildStatus>, ApiError> {
     let build = state
@@ -60,7 +62,13 @@ pub async fn get_build(
         .project(&build.project)
         .ok_or_else(|| ApiError::not_found("project not found"))?;
     let principal = auth::authenticate(&headers, &state.config);
-    auth::require_project_access(principal.as_ref(), project)?;
+    auth::require_project_or_public_build_access(
+        principal.as_ref(),
+        project,
+        state.config.auth.public_link_secret.as_deref(),
+        id,
+        query.get("token").map(String::as_str),
+    )?;
     Ok(Json(build))
 }
 
@@ -110,6 +118,56 @@ pub async fn trigger(
     }
     let id = build::run_build(state, body.project.clone()).await?;
     Ok(Json(json!({ "build_id": id, "project": body.project })))
+}
+
+pub async fn stop_build(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let build = state
+        .get_build(id)
+        .await
+        .ok_or_else(|| ApiError::not_found("build not found"))?;
+    let project = state
+        .config
+        .project(&build.project)
+        .ok_or_else(|| ApiError::not_found("project not found"))?;
+    let principal = auth::authenticate(&headers, &state.config);
+    let Some(principal) = principal.as_ref() else {
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "login required"));
+    };
+    if !auth::can_view_project(Some(principal), project) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden"));
+    }
+    if !matches!(build.state, BuildState::Queued | BuildState::Running) {
+        return Err(ApiError::bad_request(format!(
+            "build is already {}",
+            build_state_name(&build.state)
+        )));
+    }
+
+    let canceled = state
+        .request_cancel_build(id, "\n[canceled] stop requested by user\n")
+        .await;
+    if !canceled {
+        return Err(ApiError::bad_request("build cannot be stopped"));
+    }
+    if matches!(build.state, BuildState::Queued) {
+        state.persist_build(id).await;
+    }
+
+    Ok(Json(json!({ "ok": true, "build_id": id })))
+}
+
+fn build_state_name(state: &BuildState) -> &'static str {
+    match state {
+        BuildState::Queued => "queued",
+        BuildState::Running => "running",
+        BuildState::Success => "success",
+        BuildState::Failed => "failed",
+        BuildState::Canceled => "canceled",
+    }
 }
 
 /// Resolve the *effective* client IP for trust decisions. When the request

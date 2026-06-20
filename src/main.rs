@@ -81,6 +81,7 @@ async fn main() -> Result<()> {
         .route("/api/builds", get(routes::list_builds))
         .route("/api/builds/:id", get(routes::get_build))
         .route("/api/builds/:id/log", get(views::build_log_raw))
+        .route("/api/builds/:id/stop", post(routes::stop_build))
         .route("/api/builds/trigger", post(routes::trigger))
         .route("/api/artifacts", get(routes::list_artifacts))
         .route("/builds", get(views::list_builds))

@@ -1,6 +1,7 @@
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use uuid::Uuid;
 
 use crate::config::{Config, ProjectConfig, Visibility};
 use crate::error::ApiError;
@@ -52,6 +53,7 @@ pub fn can_view_project(principal: Option<&Principal>, project: &ProjectConfig) 
     }
 }
 
+#[allow(dead_code)]
 pub fn require_project_access(
     principal: Option<&Principal>,
     project: &ProjectConfig,
@@ -60,6 +62,36 @@ pub fn require_project_access(
         return Ok(());
     }
     let _ = principal;
+    Err(ApiError::new(StatusCode::NOT_FOUND, "not found"))
+}
+
+pub fn require_project_or_public_build_access(
+    principal: Option<&Principal>,
+    project: &ProjectConfig,
+    secret: Option<&str>,
+    build_id: Uuid,
+    token: Option<&str>,
+) -> Result<(), ApiError> {
+    if can_view_project(principal, project)
+        || token.is_some_and(|token| verify_public_build_token(secret, build_id, token))
+    {
+        return Ok(());
+    }
+    Err(ApiError::new(StatusCode::NOT_FOUND, "not found"))
+}
+
+pub fn require_project_or_public_path_access(
+    principal: Option<&Principal>,
+    project: &ProjectConfig,
+    secret: Option<&str>,
+    uri: &Uri,
+) -> Result<(), ApiError> {
+    if can_view_project(principal, project)
+        || query_param(uri.query(), "token")
+            .is_some_and(|token| verify_public_path_token(secret, uri.path(), token))
+    {
+        return Ok(());
+    }
     Err(ApiError::new(StatusCode::NOT_FOUND, "not found"))
 }
 
@@ -100,7 +132,76 @@ pub fn public_artifact_url(base: &str, secret: &str, artifact_path: &str) -> Str
     format!("{base}/public/artifacts/{artifact_path}?token={token}")
 }
 
+#[cfg_attr(not(feature = "discord"), allow(dead_code))]
+pub fn public_build_url(base: &str, secret: &str, build_id: Uuid) -> String {
+    let token = public_build_token(secret, build_id);
+    format!("{base}/builds/{build_id}?token={token}")
+}
+
+#[cfg_attr(not(feature = "discord"), allow(dead_code))]
+pub fn public_path_url(base: &str, secret: &str, path: &str) -> String {
+    let token = public_path_token(secret, path);
+    format!("{base}{path}?token={token}")
+}
+
 pub fn verify_public_artifact_token(
+    secret: Option<&str>,
+    artifact_path: &str,
+    token: &str,
+) -> bool {
+    verify_public_token(secret, &format!("artifact:{artifact_path}"), token)
+        || verify_legacy_public_artifact_token(secret, artifact_path, token)
+}
+
+pub fn verify_public_build_token(secret: Option<&str>, build_id: Uuid, token: &str) -> bool {
+    verify_public_token(secret, &format!("build:{build_id}"), token)
+}
+
+pub fn verify_public_path_token(secret: Option<&str>, path: &str, token: &str) -> bool {
+    verify_public_token(secret, &format!("path:{path}"), token)
+}
+
+pub fn query_param<'a>(query: Option<&'a str>, name: &str) -> Option<&'a str> {
+    query?.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (key == name).then_some(value)
+    })
+}
+
+fn verify_public_token(secret: Option<&str>, scope: &str, token: &str) -> bool {
+    let Some(secret) = secret else {
+        return false;
+    };
+    let Ok(expected) = hex::decode(token) else {
+        return false;
+    };
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
+    mac.update(scope.as_bytes());
+    mac.verify_slice(&expected).is_ok()
+}
+
+#[cfg_attr(not(feature = "discord"), allow(dead_code))]
+fn public_artifact_token(secret: &str, artifact_path: &str) -> String {
+    public_token(secret, &format!("artifact:{artifact_path}"))
+}
+
+fn public_build_token(secret: &str, build_id: Uuid) -> String {
+    public_token(secret, &format!("build:{build_id}"))
+}
+
+fn public_path_token(secret: &str, path: &str) -> String {
+    public_token(secret, &format!("path:{path}"))
+}
+
+fn public_token(secret: &str, scope: &str) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
+    mac.update(scope.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+fn verify_legacy_public_artifact_token(
     secret: Option<&str>,
     artifact_path: &str,
     token: &str,
@@ -115,14 +216,6 @@ pub fn verify_public_artifact_token(
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
     mac.update(artifact_path.as_bytes());
     mac.verify_slice(&expected).is_ok()
-}
-
-#[cfg_attr(not(feature = "discord"), allow(dead_code))]
-fn public_artifact_token(secret: &str, artifact_path: &str) -> String {
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
-    mac.update(artifact_path.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {

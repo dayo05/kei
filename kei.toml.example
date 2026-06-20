@@ -15,8 +15,9 @@ artifacts_dir = "./data/artifacts"    # served read-only at /artifacts/...
 webhook_secret = "change-me"
 
 [auth]
-# Optional secret for signed public artifact links such as Discord webhook
-# downloads. Keep this private; changing it invalidates existing public links.
+# Optional secret for signed Discord links to private/restricted build pages,
+# commit/compare pages, and artifact downloads. Keep this private; changing
+# it invalidates existing public links.
 public_link_secret = "change-me-too"
 
 [[auth.accounts]]

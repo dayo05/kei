@@ -124,6 +124,7 @@ pub async fn list_builds(State(state): State<AppState>, headers: HeaderMap) -> R
 pub async fn build_detail(
     State(state): State<AppState>,
     headers: HeaderMap,
+    uri: Uri,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
     let b = state
@@ -135,9 +136,20 @@ pub async fn build_detail(
         .project(&b.project)
         .ok_or_else(|| ApiError::not_found("project not found"))?;
     let principal = auth::authenticate(&headers, &state.config);
-    auth::require_project_access(principal.as_ref(), project)?;
+    let query_token = auth::query_param(uri.query(), "token");
+    auth::require_project_or_public_build_access(
+        principal.as_ref(),
+        project,
+        state.config.auth.public_link_secret.as_deref(),
+        id,
+        query_token,
+    )?;
 
     let live = matches!(b.state, BuildState::Queued | BuildState::Running);
+    let can_stop = live
+        && principal
+            .as_ref()
+            .is_some_and(|p| auth::can_view_project(Some(p), project));
 
     let dur = match b.finished_at {
         Some(end) => format!("{}s", (end - b.started_at).num_seconds()),
@@ -184,6 +196,7 @@ pub async fn build_detail(
             r#"<script>
 (function() {{
   const buildId = {id:?};
+  const token = new URLSearchParams(location.search).get('token');
   const NEAR_BOTTOM_PX = 24;
   const els = {{
     state: document.getElementById('state'),
@@ -195,11 +208,37 @@ pub async fn build_detail(
     artifacts: document.getElementById('artifacts'),
     errorBox: document.getElementById('error-box'),
     errorText: document.getElementById('error-text'),
+    stop: document.getElementById('stop-build'),
   }};
+  if (els.stop) {{
+    els.stop.addEventListener('click', async () => {{
+      els.stop.disabled = true;
+      els.stop.textContent = 'Stopping...';
+      let resp;
+      try {{
+        resp = await fetch('/api/builds/' + buildId + '/stop', {{ method: 'POST' }});
+      }} catch (e) {{
+        els.stop.disabled = false;
+        els.stop.textContent = 'Stop build';
+        return;
+      }}
+      if (resp.status === 401) {{
+        location.href = '/login?next=' + encodeURIComponent(location.pathname + location.search);
+        return;
+      }}
+      if (!resp.ok) {{
+        els.stop.disabled = false;
+        els.stop.textContent = 'Stop build';
+        return;
+      }}
+      tick();
+    }});
+  }}
   async function tick() {{
     let resp;
     try {{
-      resp = await fetch('/api/builds/' + buildId, {{ cache: 'no-store' }});
+      const suffix = token ? '?token=' + encodeURIComponent(token) : '';
+      resp = await fetch('/api/builds/' + buildId + suffix, {{ cache: 'no-store' }});
       if (!resp.ok) throw new Error('http ' + resp.status);
     }} catch (e) {{
       setTimeout(tick, 2000);
@@ -238,6 +277,8 @@ pub async fn build_detail(
     }}
     if (b.state === 'queued' || b.state === 'running') {{
       setTimeout(tick, 2000);
+    }} else if (els.stop) {{
+      els.stop.remove();
     }}
   }}
   setTimeout(tick, 2000);
@@ -259,9 +300,10 @@ pub async fn build_detail(
   <dt>Started</dt><dd>{started}</dd>
   <dt>Duration</dt><dd id="dur">{dur}</dd>
 </dl>
+{stop_controls}
 <div class="error" id="error-box" style="{error_style}"><strong>Error:</strong> <span id="error-text">{error_text}</span></div>
 <section id="artifacts-section" style="{artifacts_style}"><h2>Artifacts</h2><ul class="artifacts" id="artifacts">{artifacts_items}</ul></section>
-<h2>Log <a class="raw" href="/api/builds/{id}/log">raw</a></h2>
+<h2>Log <a class="raw" href="/api/builds/{id}/log{raw_token}">raw</a></h2>
 {log_html}
 {live_script}"#,
         number = b.number,
@@ -277,10 +319,18 @@ pub async fn build_detail(
         commit = b.commit.as_deref().map(html_escape).unwrap_or_default(),
         started = b.started_at.format("%Y-%m-%d %H:%M:%S UTC"),
         dur = dur,
+        stop_controls = if can_stop {
+            r#"<div class="actions"><button class="danger" id="stop-build" type="button">Stop build</button></div>"#
+        } else {
+            ""
+        },
         id = b.id,
         error_style = error_attr_style,
         artifacts_style = artifacts_section_style,
         artifacts_items = artifacts_items,
+        raw_token = query_token
+            .map(|token| format!("?token={token}"))
+            .unwrap_or_default(),
     );
     let title = format!("Build #{}", b.number);
     Ok(Html(page(&title, &body)).into_response())
@@ -305,7 +355,12 @@ pub async fn artifacts_handler(
     let Some(project) = state.config.project(project_name) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    if let Err(e) = auth::require_project_access(principal.as_ref(), project) {
+    if let Err(e) = auth::require_project_or_public_path_access(
+        principal.as_ref(),
+        project,
+        state.config.auth.public_link_secret.as_deref(),
+        &uri,
+    ) {
         return e.into_response();
     }
     serve_tree(
@@ -322,7 +377,7 @@ pub async fn public_artifact_handler(State(state): State<AppState>, uri: Uri) ->
     if rel.is_empty() || rel.ends_with('/') {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    let Some(token) = query_param(uri.query(), "token") else {
+    let Some(token) = auth::query_param(uri.query(), "token") else {
         return (StatusCode::UNAUTHORIZED, "missing token").into_response();
     };
     if !auth::verify_public_artifact_token(
@@ -443,13 +498,6 @@ fn tree_rel_path<'a>(prefix: &str, raw_path: &'a str) -> &'a str {
         .strip_prefix(prefix)
         .unwrap_or("")
         .trim_start_matches('/')
-}
-
-fn query_param<'a>(query: Option<&'a str>, name: &str) -> Option<&'a str> {
-    query?.split('&').find_map(|part| {
-        let (key, value) = part.split_once('=')?;
-        (key == name).then_some(value)
-    })
 }
 
 async fn render_artifacts_root(state: &AppState, principal: Option<&auth::Principal>) -> Response {
@@ -628,6 +676,7 @@ fn workspace_for(state: &AppState, project: &str) -> Option<std::path::PathBuf> 
 pub async fn commit_view(
     State(state): State<AppState>,
     headers: HeaderMap,
+    uri: Uri,
     Path((project, sha)): Path<(String, String)>,
 ) -> Response {
     if !valid_sha(&sha) {
@@ -640,7 +689,12 @@ pub async fn commit_view(
         return (StatusCode::NOT_FOUND, "no such project").into_response();
     };
     let principal = auth::authenticate(&headers, &state.config);
-    if let Err(e) = auth::require_project_access(principal.as_ref(), project_cfg) {
+    if let Err(e) = auth::require_project_or_public_path_access(
+        principal.as_ref(),
+        project_cfg,
+        state.config.auth.public_link_secret.as_deref(),
+        &uri,
+    ) {
         return e.into_response();
     }
     let info = match crate::git::show_commit(&workspace, &sha).await {
@@ -728,6 +782,7 @@ fn render_diff(text: &str) -> String {
 pub async fn compare_view(
     State(state): State<AppState>,
     headers: HeaderMap,
+    uri: Uri,
     Path((project, range)): Path<(String, String)>,
 ) -> Response {
     let (from, to) = match range.split_once("...") {
@@ -741,7 +796,12 @@ pub async fn compare_view(
         return (StatusCode::NOT_FOUND, "no such project").into_response();
     };
     let principal = auth::authenticate(&headers, &state.config);
-    if let Err(e) = auth::require_project_access(principal.as_ref(), project_cfg) {
+    if let Err(e) = auth::require_project_or_public_path_access(
+        principal.as_ref(),
+        project_cfg,
+        state.config.auth.public_link_secret.as_deref(),
+        &uri,
+    ) {
         return e.into_response();
     }
     let commits = match crate::git::log_range(&workspace, &from, &to).await {
@@ -822,6 +882,7 @@ fn login_body(next: &str, error: Option<&str>) -> String {
 pub async fn build_log_raw(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
     let b = state
@@ -833,7 +894,13 @@ pub async fn build_log_raw(
         .project(&b.project)
         .ok_or_else(|| ApiError::not_found("project not found"))?;
     let principal = auth::authenticate(&headers, &state.config);
-    auth::require_project_access(principal.as_ref(), project)?;
+    auth::require_project_or_public_build_access(
+        principal.as_ref(),
+        project,
+        state.config.auth.public_link_secret.as_deref(),
+        id,
+        query.get("token").map(String::as_str),
+    )?;
     let mut resp = (StatusCode::OK, b.log).into_response();
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -895,6 +962,10 @@ fn page(title: &str, body: &str) -> String {
   form.login button {{ justify-self: start; background: var(--accent); color: #07111f;
                        border: 0; border-radius: 6px; padding: 8px 14px;
                        font: inherit; font-weight: 600; cursor: pointer; }}
+  .actions {{ margin: 14px 0; }}
+  button.danger {{ background: var(--err); color: #fff; border: 0; border-radius: 6px;
+                   padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer; }}
+  button.danger:disabled {{ opacity: 0.65; cursor: wait; }}
   ul.artifacts {{ padding-left: 18px; }}
   a.raw {{ font-size: 0.75em; color: var(--muted); margin-left: 8px; }}
   .diff {{ background: var(--panel); border: 1px solid var(--border);

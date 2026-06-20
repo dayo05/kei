@@ -74,6 +74,7 @@ custom wrapper, NixOS systemd module) is documented in [`nix.md`](./nix.md).
 | GET    | `/api/projects`               | Configured project names                             |
 | GET    | `/api/builds`                 | All builds, newest first                             |
 | GET    | `/api/builds/:id`             | One build (status, current step, log, artifacts)     |
+| POST   | `/api/builds/:id/stop`        | Stop a queued/running build (authenticated account)  |
 | GET    | `/api/artifacts`              | Flat artifact list with download URLs                |
 | GET    | `/artifacts/<project>/<id>/…` | Static download (also `…/<project>/latest/…`)        |
 | GET    | `/public/artifacts/<project>/<id>/…?token=…` | Signed public artifact download |
@@ -90,10 +91,11 @@ commit view, and compare view. Browser users can also visit `/login`, enter
 their account name and token, and Kei will store the token in an HttpOnly
 cookie. `visibility = "private"` restricts a project to admin accounts only.
 
-Discord artifact links can still be public for restricted projects by setting
-`public_artifact_links = true` on the Discord target and configuring
-`[auth].public_link_secret`. Those links use signed `/public/artifacts/...`
-URLs and only serve the exact artifact file.
+Discord build/result links for restricted or private projects use
+`[auth].public_link_secret` to generate scoped signed URLs. The token grants
+access only to that build or exact commit/compare/artifact path, not to an
+account. Discord artifact downloads can also use signed `/public/artifacts/...`
+URLs by setting `public_artifact_links = true` on the Discord target.
 
 Maven artifacts are owned by project config via `maven.artifacts = [...]` and
 are public by default. Set `maven.public = false` on a project to require the

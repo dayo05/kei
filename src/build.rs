@@ -81,6 +81,7 @@ pub async fn run_build(state: AppState, project_name: String) -> anyhow::Result<
                 st.config.server.public_url.as_deref(),
                 st.config.auth.public_link_secret.as_deref(),
                 &build,
+                notify::DiscordEvent::Finished,
             )
             .await;
         }
@@ -105,7 +106,13 @@ async fn run_build_inner(
     // need a global one. This also subsumes the previous per-project lock
     // (the workspace can't be touched by two builds of the same project at
     // once, but if no two builds run concurrently at all, neither can).
-    let _guard = state.build_lock.lock().await;
+    let _guard = match state.build_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            notify_discord_event(&state, project, build_id, notify::DiscordEvent::Queued).await;
+            state.build_lock.lock().await
+        }
+    };
 
     if *cancel_rx.borrow() {
         return Ok(BuildOutcome::Canceled);
@@ -121,6 +128,7 @@ async fn run_build_inner(
             b.previous_commit = previous;
         })
         .await;
+    notify_discord_event(&state, project, build_id, notify::DiscordEvent::Started).await;
 
     let workspace = state.config.storage.workspace_dir.join(&project.name);
     let artifacts_dir = state.config.storage.artifacts_dir.clone();
@@ -284,6 +292,24 @@ async fn run_build_inner(
 
     info!(build=%build_id, project=%project.name, "build succeeded");
     Ok(BuildOutcome::Success)
+}
+
+async fn notify_discord_event(
+    state: &AppState,
+    project: &ProjectConfig,
+    build_id: Uuid,
+    event: notify::DiscordEvent,
+) {
+    if let Some(build) = state.get_build(build_id).await {
+        notify::discord_notify(
+            project,
+            state.config.server.public_url.as_deref(),
+            state.config.auth.public_link_secret.as_deref(),
+            &build,
+            event,
+        )
+        .await;
+    }
 }
 
 /// On startup, walk every configured project and trigger a build whenever the
