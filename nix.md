@@ -276,4 +276,7 @@ curl http://builder:5050/health
   it like any CI runner — dedicated host or VM.
 - **Initial SSH clones.** If a `repo_url` uses SSH, pre-seed
   `${stateDir}/.ssh/known_hosts` (e.g. via `system.activationScripts`) or
-  switch to HTTPS clone URLs.
+  switch to HTTPS clone URLs. Point `[git] ssh_key` (or a project's own
+  `ssh_key`) at the deploy key — deploy it with sops-nix/agenix and make
+  sure it's owned by `kei` and mode 0600, since `ProtectHome = true` keeps
+  the service out of any real user's `~/.ssh`.

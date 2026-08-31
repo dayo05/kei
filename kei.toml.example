@@ -25,6 +25,15 @@ name = "dayo"
 token = "paste-a-long-random-token"
 admin = true
 
+# Git remote access. `ssh_key` is the default deploy key for every project
+# that doesn't set its own; leave it unset to keep using ~/.ssh + the agent.
+# Applied as GIT_SSH_COMMAND="ssh -i <key> -o IdentitiesOnly=yes" on clone,
+# fetch, submodule updates, and the startup ls-remote probe. HTTPS remotes
+# ignore it. The key must be readable by the user kei runs as, and its host
+# must already be in that user's known_hosts.
+[git]
+# ssh_key = "/var/lib/kei/.ssh/id_deploy"
+
 # Nix integration. When enabled, each step is wrapped as:
 #   nix develop ${flake}#${shell} ${extra_args...} -c <command> <args...>
 # Per-step `use_nix = false` opts out, `nix_shell = "..."` selects a different
@@ -43,6 +52,9 @@ name = "demo"
 repo_url = "https://github.com/owner/repo.git"
 branch = "main"
 github_full_name = "owner/repo"
+# Per-project deploy key, overriding [git] ssh_key. Use this when each repo
+# has its own key (GitHub rejects reusing one deploy key across repos).
+# ssh_key = "/var/lib/kei/.ssh/id_demo"
 # public = current behavior. restricted = allowed_accounts/admins only.
 # private = admins only.
 visibility = "public"

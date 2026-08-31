@@ -3,18 +3,42 @@ use std::path::Path;
 use tokio::process::Command;
 
 /// Sync a repo at `dir` to the tip of `branch` on `origin`, force-overwriting
-/// any local divergence (handles upstream force-pushes). Returns the full
-/// command log alongside the result so callers can persist it even on failure.
-pub async fn sync(repo_url: &str, branch: &str, dir: &Path) -> (String, Result<String>) {
+/// any local divergence (handles upstream force-pushes). `ssh_key`, when set,
+/// is the private key to authenticate with (see [`apply_ssh`]). Returns the
+/// full command log alongside the result so callers can persist it even on
+/// failure.
+pub async fn sync(
+    repo_url: &str,
+    branch: &str,
+    dir: &Path,
+    ssh_key: Option<&Path>,
+) -> (String, Result<String>) {
     let mut log = String::new();
-    let r = sync_inner(repo_url, branch, dir, &mut log).await;
+    let r = sync_inner(repo_url, branch, dir, ssh_key, &mut log).await;
     (log, r)
+}
+
+/// Point git at a specific private key for this invocation. `IdentitiesOnly`
+/// stops ssh from offering the agent's keys (or `~/.ssh/id_*`) first — without
+/// it, a host that accepts several of our keys can authenticate as the wrong
+/// identity and fail authorization on the repo.
+fn apply_ssh(cmd: &mut Command, ssh_key: Option<&Path>) {
+    if let Some(key) = ssh_key {
+        // git shell-parses GIT_SSH_COMMAND, so a path with spaces needs
+        // quoting; single quotes plus the standard '\'' escape cover any path.
+        let quoted = key.to_string_lossy().replace('\'', r"'\''");
+        cmd.env(
+            "GIT_SSH_COMMAND",
+            format!("ssh -i '{quoted}' -o IdentitiesOnly=yes"),
+        );
+    }
 }
 
 async fn sync_inner(
     repo_url: &str,
     branch: &str,
     dir: &Path,
+    ssh_key: Option<&Path>,
     log: &mut String,
 ) -> Result<String> {
     let exists = dir.join(".git").is_dir();
@@ -37,29 +61,55 @@ async fn sync_inner(
                 dir_str,
             ],
             None,
+            ssh_key,
         )
         .await?;
     } else {
         // Sync remote URL in case it changed in config; ignore failure.
-        let _ = run(log, &["remote", "set-url", "origin", repo_url], Some(dir)).await;
-        run(log, &["fetch", "--prune", "--force", "origin"], Some(dir)).await?;
+        let _ = run(
+            log,
+            &["remote", "set-url", "origin", repo_url],
+            Some(dir),
+            ssh_key,
+        )
+        .await;
+        run(
+            log,
+            &["fetch", "--prune", "--force", "origin"],
+            Some(dir),
+            ssh_key,
+        )
+        .await?;
         let target = format!("origin/{branch}");
-        run(log, &["checkout", "-B", branch, &target], Some(dir)).await?;
-        run(log, &["reset", "--hard", &target], Some(dir)).await?;
-        run(log, &["clean", "-fdx"], Some(dir)).await?;
+        run(
+            log,
+            &["checkout", "-B", branch, &target],
+            Some(dir),
+            ssh_key,
+        )
+        .await?;
+        run(log, &["reset", "--hard", &target], Some(dir), ssh_key).await?;
+        run(log, &["clean", "-fdx"], Some(dir), ssh_key).await?;
         // Pick up any submodule URL changes (e.g. upstream renamed a remote).
-        run(log, &["submodule", "sync", "--recursive"], Some(dir)).await?;
+        run(
+            log,
+            &["submodule", "sync", "--recursive"],
+            Some(dir),
+            ssh_key,
+        )
+        .await?;
         // Initialize new, update existing, force-overwrite divergent ones.
         // No-op if the repo has no submodules.
         run(
             log,
             &["submodule", "update", "--init", "--recursive", "--force"],
             Some(dir),
+            ssh_key,
         )
         .await?;
     }
 
-    let head = run(log, &["rev-parse", "HEAD"], Some(dir)).await?;
+    let head = run(log, &["rev-parse", "HEAD"], Some(dir), ssh_key).await?;
     Ok(head.trim().to_string())
 }
 
@@ -215,12 +265,12 @@ pub async fn current_head(dir: &Path) -> Result<String> {
 /// the commit hash currently at the tip of <branch> on origin without touching
 /// any local workspace. Used by the startup auto-trigger to compare against
 /// `.last_commit`.
-pub async fn remote_head(repo_url: &str, branch: &str) -> Result<String> {
+pub async fn remote_head(repo_url: &str, branch: &str, ssh_key: Option<&Path>) -> Result<String> {
     let refspec = format!("refs/heads/{branch}");
-    let out = Command::new("git")
-        .args(["ls-remote", repo_url, &refspec])
-        .output()
-        .await?;
+    let mut cmd = Command::new("git");
+    cmd.args(["ls-remote", repo_url, &refspec]);
+    apply_ssh(&mut cmd, ssh_key);
+    let out = cmd.output().await?;
     if !out.status.success() {
         anyhow::bail!(
             "git ls-remote {repo_url} failed (exit {:?}): {}",
@@ -236,12 +286,18 @@ pub async fn remote_head(repo_url: &str, branch: &str) -> Result<String> {
     Ok(hash.to_string())
 }
 
-async fn run(log: &mut String, args: &[&str], dir: Option<&Path>) -> Result<String> {
+async fn run(
+    log: &mut String,
+    args: &[&str],
+    dir: Option<&Path>,
+    ssh_key: Option<&Path>,
+) -> Result<String> {
     let mut cmd = Command::new("git");
     if let Some(d) = dir {
         cmd.arg("-C").arg(d);
     }
     cmd.args(args);
+    apply_ssh(&mut cmd, ssh_key);
     log.push_str(&format!("$ git {}\n", args.join(" ")));
     let out = cmd.output().await?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();

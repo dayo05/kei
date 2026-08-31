@@ -13,6 +13,8 @@ pub struct Config {
     pub auth: AuthConfig,
     #[serde(default)]
     pub nix: NixConfig,
+    #[serde(default)]
+    pub git: GitConfig,
     /// Optional Maven repository serving. Only read when the `maven` cargo
     /// feature is enabled; harmless to configure in slim builds.
     #[cfg_attr(not(feature = "maven"), allow(dead_code))]
@@ -113,6 +115,15 @@ pub struct GithubConfig {
     pub webhook_secret: Option<String>,
 }
 
+/// Git remote access. `ssh_key` is the fallback deploy key for every project
+/// whose own `[[projects]] ssh_key` is unset; leaving both unset keeps the
+/// previous behavior (git uses whatever `~/.ssh` and the agent provide).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct GitConfig {
+    #[serde(default)]
+    pub ssh_key: Option<PathBuf>,
+}
+
 /// First-class nix integration. Steps run as `nix develop ${flake}#${shell} -c
 /// <step.command> <step.args...>` when enabled. Use `command` to fully override
 /// the wrapper (e.g. `["nix-shell", "--run"]` for non-flake projects).
@@ -169,6 +180,11 @@ pub struct ProjectConfig {
     pub repo_url: String,
     #[serde(default = "default_branch")]
     pub branch: String,
+    /// Private key used for this project's remote (clone/fetch/ls-remote and
+    /// submodules), applied as `GIT_SSH_COMMAND`. Overrides `[git] ssh_key`.
+    /// Only meaningful for SSH `repo_url`s — HTTPS remotes ignore it.
+    #[serde(default)]
+    pub ssh_key: Option<PathBuf>,
     #[serde(default)]
     pub github_full_name: Option<String>,
     #[serde(default)]
@@ -346,6 +362,12 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
         let cfg: Config = toml::from_str(&s)?;
         Ok(cfg)
+    }
+
+    /// SSH key to use when talking to `project`'s remote: the project's own
+    /// `ssh_key`, else the global `[git]` default, else none.
+    pub fn ssh_key_for<'a>(&'a self, project: &'a ProjectConfig) -> Option<&'a Path> {
+        project.ssh_key.as_deref().or(self.git.ssh_key.as_deref())
     }
 
     pub fn project(&self, name: &str) -> Option<&ProjectConfig> {

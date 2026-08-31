@@ -152,3 +152,9 @@ nix.md
   a host you're willing to treat as a CI runner.
 - `git` must be on `$PATH`. SSH clone URLs additionally need `ssh` and a
   pre-seeded `known_hosts` for the user Kei runs as.
+- Custom SSH keys: set `[git] ssh_key` for a shared deploy key, or
+  `ssh_key` on a `[[projects]]` entry to override it per repo (GitHub
+  rejects reusing one deploy key across repos). Kei passes it as
+  `GIT_SSH_COMMAND="ssh -i <key> -o IdentitiesOnly=yes"` for clone, fetch,
+  submodule updates, and the startup remote probe. Build steps are separate
+  — a step that pushes back needs the key via its own `env`.

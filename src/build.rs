@@ -142,7 +142,9 @@ async fn run_build_inner(
     state
         .update_build(build_id, |b| b.current_step = Some("git-sync".into()))
         .await;
-    let (sync_log, sync_result) = git::sync(&project.repo_url, &project.branch, &workspace).await;
+    let ssh_key = state.config.ssh_key_for(project);
+    let (sync_log, sync_result) =
+        git::sync(&project.repo_url, &project.branch, &workspace, ssh_key).await;
     state.append_log(build_id, &sync_log).await;
     let head = sync_result.context("git sync")?;
     state
@@ -319,7 +321,8 @@ async fn notify_discord_event(
 pub async fn bootstrap_initial_builds(state: AppState) {
     for project in state.config.projects.clone() {
         let last = state.last_built_commit(&project.name).await;
-        let remote = match git::remote_head(&project.repo_url, &project.branch).await {
+        let ssh_key = state.config.ssh_key_for(&project);
+        let remote = match git::remote_head(&project.repo_url, &project.branch, ssh_key).await {
             Ok(h) => h,
             Err(e) => {
                 warn!(error=%e, project=%project.name, "remote-head probe failed; skipping auto-trigger");
