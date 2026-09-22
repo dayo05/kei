@@ -218,15 +218,34 @@ async fn run_build_inner(
         }
     }
 
-    // If a step created and pushed a commit (e.g. update-docs), HEAD will
-    // have drifted from the post-sync commit. Record that drift so the
-    // notification can link to it. Errors here are non-fatal — the build
-    // succeeded regardless.
-    if let Ok(post_head) = git::current_head(&workspace).await {
-        let sync_head = state.get_build(build_id).await.and_then(|b| b.commit);
-        if sync_head.as_deref() != Some(post_head.as_str()) {
+    // A build step may create a commit (e.g. generated docs), but it runs as
+    // an isolated project user that cannot read Kei's deploy key. Only a
+    // server-side project registration can authorize Kei to push that commit.
+    let post_head = git::current_head(&workspace)
+        .await
+        .context("read post-build HEAD")?;
+    let sync_head = state.get_build(build_id).await.and_then(|b| b.commit);
+    if sync_head.as_deref() != Some(post_head.as_str()) {
+        if state.config.may_push_generated_commits(project) {
+            state
+                .update_build(build_id, |b| b.current_step = Some("git-push".into()))
+                .await;
+            state
+                .append_log(build_id, "\n=== step: git-push ===\n")
+                .await;
+            let (push_log, push_result) =
+                git::push_head(&workspace, &project.branch, ssh_key).await;
+            state.append_log(build_id, &push_log).await;
+            push_result.context("push generated commit")?;
             state
                 .update_build(build_id, |b| b.docs_commit = Some(post_head))
+                .await;
+        } else {
+            state
+                .append_log(
+                    build_id,
+                    "\n[warn] build created a commit, but server-side auto-push is disabled\n",
+                )
                 .await;
         }
     }
@@ -280,8 +299,8 @@ async fn run_build_inner(
         .await;
 
     // Remember what commit this success covered so we can detect remote drift
-    // across restarts (see `bootstrap_initial_builds`). When a build step
-    // pushed a new commit (e.g. update-docs), record THAT as the last built
+    // across restarts (see `bootstrap_initial_builds`). When Kei pushed a
+    // build-generated commit (e.g. update-docs), record THAT as the last built
     // commit — otherwise bootstrap on the next restart would see the bot's
     // [skip ci] commit as "remote moved" and rebuild it.
     let head_for_last = state

@@ -64,7 +64,28 @@ async fn sync_inner(
             ssh_key,
         )
         .await?;
-    } else {
+    }
+
+    // Git deliberately creates object directories without group write access
+    // unless the repository is marked as shared. The kei service owns the
+    // clone, while project steps may commit as a per-project build user.
+    run(
+        log,
+        &["config", "core.sharedRepository", "group"],
+        Some(dir),
+        ssh_key,
+    )
+    .await?;
+
+    // The initial clone creates objects before the local config above exists,
+    // so normalize that brand-new .git directory once. Do not repeat this for
+    // an existing checkout: build steps can legitimately own some Git objects,
+    // and the kei service user cannot chmod files owned by those users.
+    if !exists {
+        make_git_dir_group_writable(log, dir).await?;
+    }
+
+    if exists {
         // Sync remote URL in case it changed in config; ignore failure.
         let _ = run(
             log,
@@ -111,6 +132,21 @@ async fn sync_inner(
 
     let head = run(log, &["rev-parse", "HEAD"], Some(dir), ssh_key).await?;
     Ok(head.trim().to_string())
+}
+
+async fn make_git_dir_group_writable(log: &mut String, dir: &Path) -> Result<()> {
+    log.push_str("$ chmod -R g+rwX .git\n");
+    let out = Command::new("chmod")
+        .args(["-R", "g+rwX", ".git"])
+        .current_dir(dir)
+        .output()
+        .await?;
+    log.push_str(&String::from_utf8_lossy(&out.stdout));
+    log.push_str(&String::from_utf8_lossy(&out.stderr));
+    if !out.status.success() {
+        anyhow::bail!("chmod -R g+rwX .git failed (exit {:?})", out.status.code());
+    }
+    Ok(())
 }
 
 /// Single commit's metadata + diff stat, sourced from the project workspace.
@@ -259,6 +295,18 @@ pub async fn current_head(dir: &Path) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Push the workspace HEAD to the configured project branch using Kei's SSH
+/// identity. No force option is used: if the remote moved after sync, Git
+/// rejects the push and the build fails rather than overwriting remote work.
+pub async fn push_head(dir: &Path, branch: &str, ssh_key: Option<&Path>) -> (String, Result<()>) {
+    let mut log = String::new();
+    let refspec = format!("HEAD:refs/heads/{branch}");
+    let result = run(&mut log, &["push", "origin", &refspec], Some(dir), ssh_key)
+        .await
+        .map(|_| ());
+    (log, result)
 }
 
 /// Cheap remote-state probe: `git ls-remote <repo> refs/heads/<branch>` returns

@@ -30,9 +30,9 @@ pub struct BuildStatus {
     /// Captured from `.last_commit` at build start so notifications can
     /// link a compare-url showing what changed.
     pub previous_commit: Option<String>,
-    /// Set when a build step creates and pushes a commit (e.g. the
-    /// update-docs flow). Detected by comparing post-step HEAD against
-    /// the post-sync HEAD.
+    /// Set when a build step creates a commit and Kei pushes it (e.g. the
+    /// update-docs flow). Detected by comparing post-step HEAD against the
+    /// post-sync HEAD.
     pub docs_commit: Option<String>,
     pub state: BuildState,
     pub started_at: DateTime<Utc>,

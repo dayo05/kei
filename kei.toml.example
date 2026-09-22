@@ -55,6 +55,9 @@ github_full_name = "owner/repo"
 # Per-project deploy key, overriding [git] ssh_key. Use this when each repo
 # has its own key (GitHub rejects reusing one deploy key across repos).
 # ssh_key = "/var/lib/kei/.ssh/id_demo"
+# Permit Kei to push a commit created by build steps using its deploy key.
+# This is intentionally server-side only; an in-repo kei.toml cannot enable it.
+push_generated_commits = false
 # public = current behavior. restricted = allowed_accounts/admins only.
 # private = admins only.
 visibility = "public"

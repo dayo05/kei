@@ -156,5 +156,9 @@ nix.md
   `ssh_key` on a `[[projects]]` entry to override it per repo (GitHub
   rejects reusing one deploy key across repos). Kei passes it as
   `GIT_SSH_COMMAND="ssh -i <key> -o IdentitiesOnly=yes"` for clone, fetch,
-  submodule updates, and the startup remote probe. Build steps are separate
-  — a step that pushes back needs the key via its own `env`.
+  submodule updates, the startup remote probe, and authorized generated-commit
+  pushes. Set `push_generated_commits = true` only in the server-side
+  `[[projects]]` registration to let a build step create a commit that Kei
+  then pushes. An in-repo `kei.toml` cannot grant this capability. For a
+  temporary deployment override, `KEI_PUSH_GENERATED_COMMITS` accepts a
+  comma-separated project-name allowlist.

@@ -187,6 +187,11 @@ pub struct ProjectConfig {
     pub ssh_key: Option<PathBuf>,
     #[serde(default)]
     pub github_full_name: Option<String>,
+    /// Allow Kei itself to push a commit created by this project's build
+    /// steps. This belongs to the server-side project registration, not the
+    /// repository-owned `kei.toml`, because it grants use of Kei's deploy key.
+    #[serde(default)]
+    pub push_generated_commits: bool,
     #[serde(default)]
     pub nix: ProjectNixOverride,
     #[serde(default)]
@@ -257,7 +262,7 @@ pub struct DiscordTarget {
     /// the one just built (requires `github_full_name` on the project).
     #[serde(default = "default_true")]
     pub include_changes: bool,
-    /// Include a "Docs" link to the commit a build step pushed back to the
+    /// Include a "Docs" link to the generated commit Kei pushed back to the
     /// repo (e.g. the update-docs flow).
     #[serde(default = "default_true")]
     pub include_docs_commit: bool,
@@ -368,6 +373,23 @@ impl Config {
     /// `ssh_key`, else the global `[git]` default, else none.
     pub fn ssh_key_for<'a>(&'a self, project: &'a ProjectConfig) -> Option<&'a Path> {
         project.ssh_key.as_deref().or(self.git.ssh_key.as_deref())
+    }
+
+    /// Whether Kei may push a commit created by this project's build steps.
+    /// The environment allowlist is an operational override for deployments
+    /// whose generated config cannot be changed without a full system switch.
+    pub fn may_push_generated_commits(&self, project: &ProjectConfig) -> bool {
+        if project.push_generated_commits {
+            return true;
+        }
+        std::env::var("KEI_PUSH_GENERATED_COMMITS")
+            .ok()
+            .is_some_and(|projects| {
+                projects
+                    .split(',')
+                    .map(str::trim)
+                    .any(|name| name == project.name)
+            })
     }
 
     pub fn project(&self, name: &str) -> Option<&ProjectConfig> {
